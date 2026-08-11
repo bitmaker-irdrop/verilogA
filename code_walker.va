@@ -4,35 +4,36 @@
 //============================================================================
 //  code_walker
 //
-//  Walks a 6-bit digital code across the output bus: 0 -> 63 -> 0, cyclically.
+//  Walks a 7-bit digital code across the output pins: 0 -> 127 -> 0, cyclically.
 //  Each code is held for step_time seconds (default 20 us).
 //  Intended for sweeping the R-2R feedback DAC across all codes in TRAN:
 //  at each code you can capture the settled Vout, check monotonicity,
 //  and observe the transient on code transitions.
 //
-//  Fixed 6-bit bus: vout[5:0], levels 0 / vddc.
+//  Fixed 7-bit, separate scalar pins: vout6..vout0, levels 0 / vddc.
+//  MSB = vout6, LSB = vout0.
 //
 //  Walk modes (walk_mode):
-//    0 = sawtooth:    0,1,2,...,63, 0,1,2,...   (reset to 0 after max)
-//    1 = triangle:    0,1,...,63,62,...,1,0,1,...  (up then down)
+//    0 = sawtooth:    0,1,2,...,127, 0,1,2,...   (reset to 0 after max)
+//    1 = triangle:    0,1,...,127,126,...,1,0,1,...  (up then down)
 //============================================================================
 
-module code_walker (vout5, vout4, vout3, vout2, vout1, vout0);
+module code_walker (vout6, vout5, vout4, vout3, vout2, vout1, vout0);
 
     parameter real    step_time  = 20u;               // time per code (s) - 20 us
     parameter real    start_delay= 1u;                // delay before first step
     parameter real    vddc       = 1.2;               // logic high level (V)
     parameter real    tt         = 1u;                // bit transition time (s)
     parameter integer walk_mode  = 1    from [0:1];   // 0=sawtooth, 1=triangle
-    parameter integer code_start = 0    from [0:63];  // initial code
+    parameter integer code_start = 0    from [0:127]; // initial code
 
-    output vout5, vout4, vout3, vout2, vout1, vout0;
-    electrical vout5, vout4, vout3, vout2, vout1, vout0;
+    output vout6, vout5, vout4, vout3, vout2, vout1, vout0;
+    electrical vout6, vout5, vout4, vout3, vout2, vout1, vout0;
 
     integer code;        // current code on the output
     integer dir;         // walk direction: +1 / -1 (triangle mode)
 
-    localparam integer code_max = 63;   // 2^6 - 1
+    localparam integer code_max = 127;   // 2^7 - 1
 
     analog begin
         @(initial_step) begin
@@ -43,13 +44,13 @@ module code_walker (vout5, vout4, vout3, vout2, vout1, vout0);
         // every step_time seconds, starting at start_delay, advance the code
         @(timer(start_delay, step_time)) begin
             if (walk_mode == 0) begin
-                // -------- sawtooth: 0..63, then reset to 0 --------
+                // -------- sawtooth: 0..127, then reset to 0 --------
                 if (code >= code_max)
                     code = 0;
                 else
                     code = code + 1;
             end else begin
-                // -------- triangle: 0..63..0.. --------
+                // -------- triangle: 0..127..0.. --------
                 // reverse direction at the endpoints
                 if (code >= code_max)
                     dir = -1;
@@ -59,7 +60,8 @@ module code_walker (vout5, vout4, vout3, vout2, vout1, vout0);
             end
         end
 
-        // ===== drive each bit explicitly (MSB = bit5, LSB = bit0) =====
+        // ===== drive each bit explicitly (MSB = bit6, LSB = bit0) =====
+        V(vout6) <+ transition(((code >> 6) & 1) * vddc, 0, tt);
         V(vout5) <+ transition(((code >> 5) & 1) * vddc, 0, tt);
         V(vout4) <+ transition(((code >> 4) & 1) * vddc, 0, tt);
         V(vout3) <+ transition(((code >> 3) & 1) * vddc, 0, tt);
