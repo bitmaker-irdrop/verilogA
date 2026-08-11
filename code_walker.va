@@ -1,18 +1,20 @@
 `include "constants.h"
 `include "discipline.h"
 
-module code_walker (vout);
+module trim (vout);
 
-    parameter real    step_time   = 20u;   // time held per code (s)
+    parameter real    step_time   = 20u;   // time held per code in TRAN (s)
     parameter real    start_delay = 1u;    // initial delay before walking
-    parameter real    vddc        = 1.2;   // logic high level
+    parameter real    vddc        = 1.5;   // logic high level (supply)
     parameter real    tt          = 1u;    // bit transition time
     parameter integer walk_mode   = 1 from [0:1];   // 0 = sawtooth, 1 = triangle
-    parameter integer code_init   = 0 from [0:127]; // starting code
+    parameter integer en_tran     = 1 from [0:1];   // 1 = TRAN walk, 0 = DC hold code_def
+    parameter integer code_def    = 0 from [0:127]; // default / DC code (also TRAN start)
 
     output [6:0] vout;
     electrical [6:0] vout;
 
+    integer walk_code;    // code advanced by the TRAN walker
     integer out_code;     // code actually driven to vout
     integer dir;          // walk direction: +1 / -1 (triangle)
 
@@ -20,26 +22,37 @@ module code_walker (vout);
 
     analog begin
         @(initial_step) begin
-            out_code = code_init;
-            dir      = 1;
+            walk_code = code_def;
+            out_code  = code_def;
+            dir       = 1;
         end
 
         @(timer(start_delay, step_time)) begin
-            if (walk_mode == 0) begin
-                // sawtooth: 0 -> 127, reset to 0
-                if (out_code >= code_max)
-                    out_code = 0;
-                else
-                    out_code = out_code + 1;
-            end else begin
-                // triangle: 0 -> 127 -> 0
-                if (out_code >= code_max)
-                    dir = -1;
-                else if (out_code <= 0)
-                    dir = 1;
-                out_code = out_code + dir;
+            if (en_tran) begin
+                if (walk_mode == 0) begin
+                    // sawtooth: 0 -> 127, reset to 0
+                    if (walk_code >= code_max)
+                        walk_code = 0;
+                    else
+                        walk_code = walk_code + 1;
+                end else begin
+                    // triangle: 0 -> 127 -> 0
+                    if (walk_code >= code_max)
+                        dir = -1;
+                    else if (walk_code <= 0)
+                        dir = 1;
+                    walk_code = walk_code + dir;
+                end
             end
         end
+
+        // ===== output code selection =====
+        // en_tran = 1 : walk codes in TRAN
+        // en_tran = 0 : hold code_def from t=0 (works in DC)
+        if (en_tran)
+            out_code = walk_code;
+        else
+            out_code = code_def;
 
         V(vout[0]) <+ transition(((out_code >> 0) & 1) * vddc, 0, tt);
         V(vout[1]) <+ transition(((out_code >> 1) & 1) * vddc, 0, tt);
@@ -50,7 +63,7 @@ module code_walker (vout);
         V(vout[6]) <+ transition(((out_code >> 6) & 1) * vddc, 0, tt);
 
         @(final_step)
-            $strobe("CODE_WALKER done: last_code=%d", out_code);
+            $strobe("CODE_WALKER done: en_tran=%d last_code=%d", en_tran, out_code);
     end
 
 endmodule
