@@ -4,61 +4,52 @@
 //============================================================================
 //  code_walker
 //
-//  Walks a digital code across the output bus: 0 -> max -> 0, cyclically.
+//  Walks a 6-bit digital code across the output bus: 0 -> 63 -> 0, cyclically.
 //  Each code is held for step_time seconds (default 20 us).
 //  Intended for sweeping the R-2R feedback DAC across all codes in TRAN:
 //  at each code you can capture the settled Vout, check monotonicity,
 //  and observe the transient on code transitions.
 //
-//  Resolution is set by the nbits parameter (default 7 for this divider).
-//  Output is the bus vout[nbits-1:0], levels 0 / vddc.
+//  Fixed 6-bit bus: vout[5:0], levels 0 / vddc.
 //
 //  Walk modes (walk_mode):
-//    0 = sawtooth:    0,1,2,...,max, 0,1,2,...   (reset to 0 after max)
-//    1 = triangle:    0,1,...,max,max-1,...,1,0,1,...  (up then down)
+//    0 = sawtooth:    0,1,2,...,63, 0,1,2,...   (reset to 0 after max)
+//    1 = triangle:    0,1,...,63,62,...,1,0,1,...  (up then down)
 //============================================================================
 
-module code_walker (vout);
+module code_walker (vout5, vout4, vout3, vout2, vout1, vout0);
 
-    parameter integer nbits      = 7    from [1:32];  // DAC resolution
     parameter real    step_time  = 20u;               // time per code (s) - 20 us
     parameter real    start_delay= 1u;                // delay before first step
     parameter real    vddc       = 1.2;               // logic high level (V)
     parameter real    tt         = 1u;                // bit transition time (s)
     parameter integer walk_mode  = 1    from [0:1];   // 0=sawtooth, 1=triangle
-    parameter integer code_start = 0;                 // initial code
+    parameter integer code_start = 0    from [0:63];  // initial code
 
-    output [nbits-1:0] vout;
-    electrical [nbits-1:0] vout;
+    output vout5, vout4, vout3, vout2, vout1, vout0;
+    electrical vout5, vout4, vout3, vout2, vout1, vout0;
 
     integer code;        // current code on the output
     integer dir;         // walk direction: +1 / -1 (triangle mode)
-    integer code_max;    // = 2^nbits - 1
-    genvar  gi;          // index for static bus unrolling
+
+    localparam integer code_max = 63;   // 2^6 - 1
 
     analog begin
         @(initial_step) begin
-            code_max = (1 << nbits) - 1;
-            // clamp start code into range
-            if (code_start < 0)
-                code = 0;
-            else if (code_start > code_max)
-                code = code_max;
-            else
-                code = code_start;
-            dir = 1;
+            code = code_start;
+            dir  = 1;
         end
 
         // every step_time seconds, starting at start_delay, advance the code
         @(timer(start_delay, step_time)) begin
             if (walk_mode == 0) begin
-                // -------- sawtooth: 0..max, then reset to 0 --------
+                // -------- sawtooth: 0..63, then reset to 0 --------
                 if (code >= code_max)
                     code = 0;
                 else
                     code = code + 1;
             end else begin
-                // -------- triangle: 0..max..0.. --------
+                // -------- triangle: 0..63..0.. --------
                 // reverse direction at the endpoints
                 if (code >= code_max)
                     dir = -1;
@@ -68,15 +59,16 @@ module code_walker (vout);
             end
         end
 
-        // ===== decompose code into bus bits =====
-        // LSB is vout[0], MSB is vout[nbits-1]
-        // genvar loop unrolls statically; code is read dynamically
-        for (gi = 0; gi < nbits; gi = gi + 1) begin
-            V(vout[gi]) <+ transition(((code >> gi) & 1) * vddc, 0, tt);
-        end
+        // ===== drive each bit explicitly (MSB = bit5, LSB = bit0) =====
+        V(vout5) <+ transition(((code >> 5) & 1) * vddc, 0, tt);
+        V(vout4) <+ transition(((code >> 4) & 1) * vddc, 0, tt);
+        V(vout3) <+ transition(((code >> 3) & 1) * vddc, 0, tt);
+        V(vout2) <+ transition(((code >> 2) & 1) * vddc, 0, tt);
+        V(vout1) <+ transition(((code >> 1) & 1) * vddc, 0, tt);
+        V(vout0) <+ transition(((code >> 0) & 1) * vddc, 0, tt);
 
         @(final_step)
-            $strobe("CODE_WALKER done: last_code=%d code_max=%d", code, code_max);
+            $strobe("CODE_WALKER done: last_code=%d", code);
     end
 
 endmodule
