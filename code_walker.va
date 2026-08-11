@@ -4,21 +4,20 @@
 //============================================================================
 //  code_walker
 //
-//  Walks a 7-bit digital code across the output pins: 0 -> 127 -> 0, cyclically.
-//  Each code is held for step_time seconds (default 20 us).
+//  Walks a 7-bit digital code on the output bus vout<6:0>: 0 -> 127 -> 0,
+//  cyclically. Each code is held for step_time seconds (default 20 us).
 //  Intended for sweeping the R-2R feedback DAC across all codes in TRAN:
 //  at each code you can capture the settled Vout, check monotonicity,
 //  and observe the transient on code transitions.
 //
-//  Fixed 7-bit, separate scalar pins: vout6..vout0, levels 0 / vddc.
-//  MSB = vout6, LSB = vout0.
+//  Bus vout[6:0], levels 0 / vddc. MSB = vout[6], LSB = vout[0].
 //
 //  Walk modes (walk_mode):
 //    0 = sawtooth:    0,1,2,...,127, 0,1,2,...   (reset to 0 after max)
 //    1 = triangle:    0,1,...,127,126,...,1,0,1,...  (up then down)
 //============================================================================
 
-module code_walker (vout6, vout5, vout4, vout3, vout2, vout1, vout0);
+module code_walker (vout);
 
     parameter real    step_time  = 20u;               // time per code (s) - 20 us
     parameter real    start_delay= 1u;                // delay before first step
@@ -27,8 +26,8 @@ module code_walker (vout6, vout5, vout4, vout3, vout2, vout1, vout0);
     parameter integer walk_mode  = 1    from [0:1];   // 0=sawtooth, 1=triangle
     parameter integer code_start = 0    from [0:127]; // initial code
 
-    output vout6, vout5, vout4, vout3, vout2, vout1, vout0;
-    electrical vout6, vout5, vout4, vout3, vout2, vout1, vout0;
+    output [6:0] vout;
+    electrical [6:0] vout;
 
     integer code;        // current code on the output
     integer dir;         // walk direction: +1 / -1 (triangle mode)
@@ -60,14 +59,14 @@ module code_walker (vout6, vout5, vout4, vout3, vout2, vout1, vout0);
             end
         end
 
-        // ===== drive each bit explicitly (MSB = bit6, LSB = bit0) =====
-        V(vout6) <+ transition(((code >> 6) & 1) * vddc, 0, tt);
-        V(vout5) <+ transition(((code >> 5) & 1) * vddc, 0, tt);
-        V(vout4) <+ transition(((code >> 4) & 1) * vddc, 0, tt);
-        V(vout3) <+ transition(((code >> 3) & 1) * vddc, 0, tt);
-        V(vout2) <+ transition(((code >> 2) & 1) * vddc, 0, tt);
-        V(vout1) <+ transition(((code >> 1) & 1) * vddc, 0, tt);
-        V(vout0) <+ transition(((code >> 0) & 1) * vddc, 0, tt);
+        // ===== drive each bus bit explicitly (MSB = vout[6], LSB = vout[0]) =====
+        V(vout[6]) <+ transition(((code >> 6) & 1) * vddc, 0, tt);
+        V(vout[5]) <+ transition(((code >> 5) & 1) * vddc, 0, tt);
+        V(vout[4]) <+ transition(((code >> 4) & 1) * vddc, 0, tt);
+        V(vout[3]) <+ transition(((code >> 3) & 1) * vddc, 0, tt);
+        V(vout[2]) <+ transition(((code >> 2) & 1) * vddc, 0, tt);
+        V(vout[1]) <+ transition(((code >> 1) & 1) * vddc, 0, tt);
+        V(vout[0]) <+ transition(((code >> 0) & 1) * vddc, 0, tt);
 
         @(final_step)
             $strobe("CODE_WALKER done: last_code=%d", code);
