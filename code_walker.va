@@ -1,0 +1,82 @@
+`include "constants.h"
+`include "discipline.h"
+
+//============================================================================
+//  code_walker
+//
+//  Прогоняет цифровой код по выходной шине: 0 -> max -> 0, циклически.
+//  Каждый шаг держится step_time секунд (по умолчанию 20 мкс).
+//  Предназначен для прогона R-2R DAC обратной связи по всем кодам в TRAN:
+//  на каждом коде можно снять установившийся Vout, проверить монотонность,
+//  измерить транзиент на переходах кодов.
+//
+//  Разрядность задаётся параметром nbits (по умолчанию 7 под твой делитель).
+//  Выход — шина vout[nbits-1:0], уровни 0 / vddc.
+//
+//  Режимы обхода (walk_mode):
+//    0 = пила вверх:      0,1,2,...,max, 0,1,2,...   (сброс в 0 после max)
+//    1 = треугольник:     0,1,...,max,max-1,...,1,0,1,...  (вверх и вниз)
+//============================================================================
+
+module code_walker (vout);
+
+    parameter integer nbits      = 7    from [1:32];  // разрядность DAC
+    parameter real    step_time  = 20u;               // время на код (с) — 20 мкс
+    parameter real    start_delay= 1u;                // задержка до старта
+    parameter real    vddc       = 1.2;               // логическая 1 (В)
+    parameter real    tt         = 1u;                // время фронта бита (с)
+    parameter integer walk_mode  = 1    from [0:1];   // 0=пила, 1=треугольник
+    parameter integer code_start = 0;                 // стартовый код
+
+    output [nbits-1:0] vout;
+    electrical [nbits-1:0] vout;
+
+    integer code;        // текущий код на выходе
+    integer dir;         // направление обхода: +1 / -1 (для треугольника)
+    integer code_max;    // = 2^nbits - 1
+    genvar  gi;          // индекс для статического разворота шины
+
+    analog begin
+        @(initial_step) begin
+            code_max = (1 << nbits) - 1;
+            // ограничим стартовый код диапазоном
+            if (code_start < 0)
+                code = 0;
+            else if (code_start > code_max)
+                code = code_max;
+            else
+                code = code_start;
+            dir = 1;
+        end
+
+        // каждые step_time секунд, начиная со start_delay, — следующий код
+        @(timer(start_delay, step_time)) begin
+            if (walk_mode == 0) begin
+                // -------- пила вверх: 0..max, затем сброс в 0 --------
+                if (code >= code_max)
+                    code = 0;
+                else
+                    code = code + 1;
+            end else begin
+                // -------- треугольник: 0..max..0.. --------
+                // развернуть на границах
+                if (code >= code_max)
+                    dir = -1;
+                else if (code <= 0)
+                    dir = 1;
+                code = code + dir;
+            end
+        end
+
+        // ===== разложение кода в биты шины =====
+        // младший бит vout[0], старший vout[nbits-1]
+        // genvar-цикл разворачивается статически; code читается динамически
+        for (gi = 0; gi < nbits; gi = gi + 1) begin
+            V(vout[gi]) <+ transition(((code >> gi) & 1) * vddc, 0, tt);
+        end
+
+        @(final_step)
+            $strobe("CODE_WALKER done: last_code=%d code_max=%d", code, code_max);
+    end
+
+endmodule
