@@ -55,9 +55,15 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     parameter integer en_temp    = 1 from [0:1];
     parameter real    temp_start = 27;    // initial = measurement temperature; may be 170
     parameter real    temp_trim  = 150;   // trimm_cal temp_cal
-    parameter real    temp_step  = 10;
-    parameter integer temp_ticks = 21 from [1:inf);  // fixed window, covers -40..170
-    parameter integer temp_mult  = 10 from [1:inf);  // Tstep ticks per temperature step
+    parameter real    temp_step  = 1;     // degrees per micro-step.  $cds_set_temperature
+                                          // is a DISCONTINUOUS change of every device model
+                                          // at a single timepoint, so this is the size of
+                                          // the kick the solver has to swallow.  Halve it
+                                          // again if the ramp still will not converge.
+    parameter real    temp_dt    = 20u;   // time between micro-steps.  The ramp runs on its
+                                          // own time base, independent of Tstep, so a fine
+                                          // step costs resolution, not run time.
+    parameter real    temp_settle = 200u; // dwell after the goal is reached
 
     // ---------------- trim search ----------------
     parameter integer cal_en     = 1 from [0:1];   // 1 = search at temp_trim, 0 = hold trim_code
@@ -106,10 +112,10 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     inout        vout_sense; electrical      vout_sense;  // senses V_OUT and sinks the current
 
     integer dac_code, ss_code, act, trim_val;
-    integer state, cnt, wcnt, div_now, sub, pulse, ramp_cnt, cstep;
+    integer state, cnt, wcnt, div_now, sub, pulse, cstep;
     integer up_target, ss_target, up_final, dn_final, temp_final, up_div;
     integer trim_goal, trim_ret, trim_div, dn_ticks;
-    real    il_now, id_now, temp_cur, temp_goal, tt_load, cal_tgt;
+    real    il_now, id_now, temp_goal, tt_load, cal_tgt;
 
     localparam S_IDLE     = 0;
     localparam S_UP_SS    = 1;
@@ -141,6 +147,7 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     (* desc="V_OUT after trim", units="V"  *) real    v_cal;
     (* desc="measurement ramp start", units="s" *) real t_meas0;
     (* desc="ticks per code on descent"    *) integer dn_ticks_s;
+    (* desc="temperature", units="C"       *) real    temp_cur;
     (* desc="load current", units="A"      *) real    i_l;
     (* desc="discharge current", units="A" *) real    i_d;
 
@@ -168,7 +175,7 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
             trim_goal = trim_code;  trim_ret = S_IDLE;  trim_div = 1;
             v_meas = 0.0;  v_cal = 0.0;  t_meas0 = 0.0;
             state = S_IDLE;  cnt = 0;  wcnt = 0;  sub = 0;  div_now = 1;
-            pulse = 0;  ramp_cnt = 0;  cstep = 0;  up_div = 1;
+            pulse = 0;  cstep = 0;  up_div = 1;
             up_target = code_pre;  ss_target = ss_low;
             up_final = 0;  dn_final = 0;  temp_final = 0;
             il_now = 0.0;  id_now = 0.0;
@@ -179,13 +186,29 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
             if (cal_target > 0.0) cal_tgt = cal_target;
             else                  cal_tgt = v_base + v_step * code_pre;
             temp_cur  = temp_start;
-            temp_goal = temp_trim;
+            temp_goal = temp_start;    // the FSM arms the ramp; nothing moves before that
             if (en_tran && en_temp) $cds_set_temperature(temp_cur);
             if (!en_tran) begin
                 dac_code = code_init;
                 ss_code  = ss_def;
                 act      = act_def;
                 il_now   = i_lo;
+            end
+        end
+
+        //  Temperature walks on its own clock.  Small steps keep each
+        //  $cds_set_temperature discontinuity small enough for the solver,
+        //  and temp_dt keeps the ramp short in wall-clock time.
+        @(timer(start_delay, temp_dt)) begin
+            if (en_tran && en_temp) begin
+                if (abs(temp_cur - temp_goal) > temp_step) begin
+                    if (temp_goal > temp_cur) temp_cur = temp_cur + temp_step;
+                    else                      temp_cur = temp_cur - temp_step;
+                    $cds_set_temperature(temp_cur);
+                end else if (temp_cur != temp_goal) begin
+                    temp_cur = temp_goal;
+                    $cds_set_temperature(temp_cur);
+                end
             end
         end
 
@@ -257,8 +280,8 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                             if (en_temp) begin
                                 temp_goal  = temp_trim;
                                 temp_final = 0;
-                                ramp_cnt   = 0;
-                                div_now    = temp_mult;
+                                wcnt       = 0;
+                                div_now    = 1;
                                 phase      = 4;
                                 state      = S_TEMP_RMP;
                             end else begin
@@ -268,22 +291,19 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                     end
 
                     S_TEMP_RMP: begin
-                        if (abs(temp_cur - temp_goal) > temp_step) begin
-                            if (temp_goal > temp_cur) temp_cur = temp_cur + temp_step;
-                            else                      temp_cur = temp_cur - temp_step;
-                            $cds_set_temperature(temp_cur);
-                        end else if (temp_cur != temp_goal) begin
-                            temp_cur = temp_goal;
-                            $cds_set_temperature(temp_cur);
-                        end
-                        ramp_cnt = ramp_cnt + 1;
-                        if (ramp_cnt >= temp_ticks) begin
-                            div_now = 1;  wcnt = 0;
-                            if (verbose) $strobe("LDO_TEST at %g C, t=%g", temp_cur, $abstime);
-                            if (temp_final) begin
-                                phase = 8;  state = S_HOLD_RET;
-                            end else begin
-                                phase = 5;  state = S_HOLD_HOT;
+                        //  the ramp itself runs on the temp_dt timer; just wait for it
+                        if (temp_cur != temp_goal) wcnt = 0;
+                        else begin
+                            wcnt = wcnt + 1;
+                            if (wcnt * Tstep >= temp_settle) begin
+                                wcnt = 0;
+                                if (verbose)
+                                    $strobe("LDO_TEST at %g C, t=%g", temp_cur, $abstime);
+                                if (temp_final) begin
+                                    phase = 8;  state = S_HOLD_RET;
+                                end else begin
+                                    phase = 5;  state = S_HOLD_HOT;
+                                end
                             end
                         end
                     end
@@ -348,8 +368,8 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                             if (en_temp) begin
                                 temp_goal  = temp_start;   // back to the measurement temperature
                                 temp_final = 1;
-                                ramp_cnt   = 0;
-                                div_now    = temp_mult;
+                                wcnt       = 0;
+                                div_now    = 1;
                                 phase      = 4;
                                 state      = S_TEMP_RMP;
                             end else begin
