@@ -9,8 +9,15 @@
 //
 //  v_ideal carries the expected output, so the MC error is simply
 //      V(vout) - V(v_ideal)      [ /0.025 for LSB, /V(v_ideal) for % ]
+//
+//  Hook-up:
+//      vout_sense -> LDO output.  Nothing else.  The module senses the node and
+//                    sinks load + discharge current from it directly.
+//                    Total current: I(<inst>:vout_sense).
+//                    Split: the saved reals i_l (load) and i_d (discharge).
+//      To run with no load at all, set i_lo = i_hi = i_dis_a = 0.
 
-module ldo_test_seq (dac, ss, act_en, trim, i_load, i_dis, dis_en, v_ideal, vout_sense);
+module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
 
     // ---------------- timing ----------------
     parameter real    Tstep       = 20u;
@@ -56,12 +63,18 @@ module ldo_test_seq (dac, ss, act_en, trim, i_load, i_dis, dis_en, v_ideal, vout
     // ---------------- measurement ramp ----------------
     parameter integer up_mult = 1 from [1:inf);    // Tstep ticks per code on the final ascent
 
-    // ---------------- load / discharge (1 V on the port = 1 A) ----------------
+    // ---------------- load / discharge ----------------
     parameter real    i_lo  = 20m;
     parameter real    i_hi  = 380m;
     parameter real    di_dt = 10M;     // A/s -> 10 A/us
     parameter real    i_dis_a = 15m;
     parameter integer dis_off_ss = 2 from [0:31];
+    parameter real    v_comp = 10m;    // compliance knee of the internal sink: below a few
+                                       // v_comp the current folds back, so a collapsing
+                                       // output cannot be dragged negative.  Keep it well
+                                       // under the lowest plateau (100 mV) -- the small-signal
+                                       // conductance of the fold-back is I*sech2(V/v_comp)/v_comp,
+                                       // which at 100 mV / 10 mV / 20 mA is 61 Mohm, i.e. gone.
 
     // ---------------- descent pacing ----------------
     parameter integer dn_adapt  = 1 from [0:1];
@@ -86,16 +99,14 @@ module ldo_test_seq (dac, ss, act_en, trim, i_load, i_dis, dis_en, v_ideal, vout
     output [4:0] ss;        electrical [4:0] ss;
     output       act_en;    electrical       act_en;
     output [3:0] trim;      electrical [3:0] trim;
-    output       i_load;    electrical       i_load;   // VCCS: 1 V = 1 A
-    output       i_dis;     electrical       i_dis;    // VCCS: 1 V = 1 A
-    output       dis_en;    electrical       dis_en;
     output       v_ideal;   electrical       v_ideal;  // expected V_OUT, for the error trace
-    input        vout_sense; electrical      vout_sense;
+    inout        vout_sense; electrical      vout_sense;  // senses V_OUT and sinks the current
 
-    integer dac_code, ss_code, act, dis_on, trim_val;
+    integer dac_code, ss_code, act, trim_val;
     integer state, cnt, wcnt, div_now, sub, pulse, ramp_cnt, cstep;
     integer up_target, ss_target, up_final, dn_final, temp_final, up_div;
     real    il_now, id_now, v1, v2, temp_cur, temp_goal, tt_load, cal_tgt;
+    real    comp;
 
     localparam S_IDLE     = 0;
     localparam S_UP_SS    = 1;
@@ -126,6 +137,8 @@ module ldo_test_seq (dac, ss, act_en, trim, i_load, i_dis, dis_en, v_ideal, vout
     (* desc="V_OUT after trim", units="V"  *) real    v_cal;
     (* desc="measurement ramp start", units="s" *) real t_meas0;
     (* desc="worst down divider"           *) integer dn_worst;
+    (* desc="load current", units="A"      *) real    i_l;
+    (* desc="discharge current", units="A" *) real    i_d;
 
     analog function real dn_div;
         input vf, vt, rl, ic, cl, ts, marg, adapt, dmult, dmax;
@@ -150,7 +163,7 @@ module ldo_test_seq (dac, ss, act_en, trim, i_load, i_dis, dis_en, v_ideal, vout
 
     analog begin
         @(initial_step) begin
-            dac_code = 0;  ss_code = 0;  act = 0;  dis_on = 0;
+            dac_code = 0;  ss_code = 0;  act = 0;
             trim_val = trim_code;  best_code = trim_code;  best_err = inf;
             v_meas = 0.0;  v_cal = 0.0;  t_meas0 = 0.0;
             state = S_IDLE;  cnt = 0;  wcnt = 0;  sub = 0;  div_now = 1;
@@ -382,7 +395,7 @@ module ldo_test_seq (dac, ss, act_en, trim, i_load, i_dis, dis_en, v_ideal, vout
                             if (cnt < ss_target) cnt = ss_target;
                             ss_code = cnt;  v2 = v_step * cnt;
                             if (dn_final && cnt <= dis_off_ss) begin
-                                id_now = 0.0;  il_now = 0.0;  dis_on = 0;
+                                id_now = 0.0;  il_now = 0.0;
                             end
                             div_now = dn_div(v1, v2, r_load, il_now + id_now, c_out,
                                              Tstep, dn_margin, dn_adapt, dn_mult, dn_max);
@@ -390,7 +403,7 @@ module ldo_test_seq (dac, ss, act_en, trim, i_load, i_dis, dis_en, v_ideal, vout
                         end else begin
                             div_now = 1;  wcnt = 0;
                             if (dn_final) begin
-                                id_now = 0.0;  il_now = 0.0;  dis_on = 0;
+                                id_now = 0.0;  il_now = 0.0;
                                 phase = 14;  state = S_END;
                             end else begin
                                 phase = 9;   state = S_HOLD_LOW;
@@ -446,7 +459,6 @@ module ldo_test_seq (dac, ss, act_en, trim, i_load, i_dis, dis_en, v_ideal, vout
 
                     // ============ discharge + final descent ============
                     S_DIS_ON: begin
-                        dis_on = 1;
                         id_now = i_dis_a;
                         wcnt   = wcnt + 1;
                         if (wcnt * Tstep >= hold_dis) begin
@@ -485,9 +497,20 @@ module ldo_test_seq (dac, ss, act_en, trim, i_load, i_dis, dis_en, v_ideal, vout
         V(trim[2]) <+ transition(((trim_val >> 2) & 1) * vddc, 0, tt);
         V(trim[3]) <+ transition(((trim_val >> 3) & 1) * vddc, 0, tt);
 
-        V(i_load) <+ transition(il_now, 0, tt_load, tt_load);
-        V(i_dis)  <+ transition(id_now, 0, tt_dis,  tt_dis);
-        V(dis_en) <+ transition(dis_on * vdd_hv, 0, tt);
+        // ---- the sink: load + discharge, straight out of vout_sense ----
+        // i_l / i_d are saved, so the two contributions stay separable in the
+        // waveform browser even though only their sum reaches the node.
+        i_l = transition(il_now, 0, tt_load, tt_load);   // 36 ns edge from di_dt
+        i_d = transition(id_now, 0, tt_dis,  tt_dis);
+
+        // compliance: smooth fold-back near zero so the sink cannot drive the
+        // node negative if the regulator gives up.  With the default
+        // v_comp = 10 mV the error is already below 1 nA at the 100 mV plateau.
+        // tanh is odd and C-infinity: below zero the branch becomes restoring
+        // instead of kinking, which is what keeps the solver happy.
+        comp = tanh(V(vout_sense) / v_comp);
+
+        I(vout_sense) <+ comp * (i_l + i_d);
 
         // expected output -> error trace is simply V(vout) - V(v_ideal)
         V(v_ideal) <+ transition(act ? (v_base + v_step * dac_code)
