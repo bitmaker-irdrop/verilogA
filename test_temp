@@ -3,10 +3,13 @@
 
 //  System test / Monte-Carlo sequencer for the adaptive LDO.
 //
-//  soft start -> 500 mV -> heat to 150 C -> trim search -> cool back to the
-//  initial temperature -> down to 100 mV -> dwell -> MEASUREMENT RAMP to the
-//  target (every code, error vs v_ideal) -> load steps -> discharge down to
-//  100 mV -> the sink drops to i_end (1 uA) and the run ends there.
+//  soft start -> ramp to code_pre (3.300 V) -> heat to 150 C -> trim search
+//  -> cool back to the initial temperature -> down to 100 mV -> dwell ->
+//  MEASUREMENT RAMP to code_init (every code, error vs v_ideal) -> load steps
+//  -> discharge down to 100 mV -> the sink drops to i_end (1 uA) and it ends.
+//
+//  The trim is searched at 3.3 V, where one LSB moves the output 6.6x more
+//  than at 500 mV -- the same place a tester would measure it.
 //
 //  Every descent step lasts exactly dn_ticks * Tstep.  A constant-current sink
 //  gives a constant dV/dt, so one number paces the whole ramp and the steps are
@@ -32,8 +35,10 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
 
     // ---------------- codes ----------------
     parameter integer code_init = 127 from [0:127];  // final target
-    parameter integer code_pre  = 0   from [0:127];  // plateau for heating + trim search
-                                                     // (112 -> 3.3 V gives the finest trim)
+    parameter integer code_pre  = 112 from [0:127];  // plateau for heating + trim search.
+                                                     // 112 -> 3.300 V: the trim is measured
+                                                     // where its effect is largest, which is
+                                                     // how a tester would actually do it.
     parameter integer dac_step  = 1 from [1:127];
     parameter integer ss_top    = 19 from [1:31];
     parameter integer ss_step   = 1 from [1:31];
