@@ -69,12 +69,8 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     parameter integer cal_en     = 1 from [0:1];   // 1 = search at temp_trim, 0 = hold trim_code
     parameter real    cal_target = 0;              // expected V_OUT at code_pre; 0 = auto
     parameter integer cal_mult   = 10 from [1:inf);// Tstep ticks per trim code
-    parameter integer trim_code  = 8 from [0:15];  // used when cal_en = 0
-    parameter integer trim_slew  = 1 from [0:1];   // 1 = walk the trim bus one LSB per
-                                                   // tick instead of jumping to a code.
-                                                   // The trim sits inside the loop, so a
-                                                   // jump (8 -> 0 at the start of the
-                                                   // search) is an 8 LSB kick to Vref.
+    parameter integer trim_code  = 8 from [0:15];  // held while cal_en = 0, and during
+                                                   // start-up / heating when cal_en = 1
 
     // ---------------- measurement ramp ----------------
     parameter integer up_mult = 1 from [1:inf);    // Tstep ticks per code on the final ascent
@@ -114,7 +110,7 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     integer dac_code, ss_code, act, trim_val;
     integer state, cnt, wcnt, div_now, sub, pulse, cstep;
     integer up_target, ss_target, up_final, dn_final, temp_final, up_div;
-    integer trim_goal, trim_ret, trim_div, dn_ticks;
+    integer dn_ticks;
     real    il_now, id_now, temp_goal, tt_load, cal_tgt;
 
     localparam S_IDLE     = 0;
@@ -138,7 +134,6 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     localparam S_LD_LO    = 18;
     localparam S_DIS_ON   = 19;
     localparam S_END      = 20;
-    localparam S_TRIM_MV  = 21;  // slew the trim bus to trim_goal, then go to trim_ret
 
     (* desc="phase"                        *) integer phase;
     (* desc="trim code found"              *) integer best_code;
@@ -172,7 +167,6 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
         @(initial_step) begin
             dac_code = 0;  ss_code = 0;  act = 0;
             trim_val = trim_code;  best_code = trim_code;  best_err = 1k;
-            trim_goal = trim_code;  trim_ret = S_IDLE;  trim_div = 1;
             v_meas = 0.0;  v_cal = 0.0;  t_meas0 = 0.0;
             state = S_IDLE;  cnt = 0;  wcnt = 0;  sub = 0;  div_now = 1;
             pulse = 0;  cstep = 0;  up_div = 1;
@@ -315,15 +309,8 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                                 cstep    = 0;
                                 best_err = 1k;
                                 phase    = 6;
-                                if (trim_slew) begin
-                                    trim_goal = 0;  trim_ret = S_CAL;
-                                    trim_div  = cal_mult;
-                                    div_now   = 1;
-                                    state     = S_TRIM_MV;
-                                end else begin
-                                    div_now = cal_mult;
-                                    state   = S_CAL;
-                                end
+                                div_now  = cal_mult;
+                                state    = S_CAL;
                             end else begin
                                 wcnt = 0;  phase = 7;  state = S_HOLD_CAL;
                             end
@@ -343,18 +330,11 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                             trim_val = cstep;
                             cstep    = cstep + 1;
                         end else begin
-                            wcnt  = 0;
-                            phase = 7;
-                            if (trim_slew) begin
-                                trim_goal = best_code;  trim_ret = S_HOLD_CAL;
-                                trim_div  = 1;
-                                div_now   = 1;
-                                state     = S_TRIM_MV;
-                            end else begin
-                                trim_val = best_code;
-                                div_now  = 1;
-                                state    = S_HOLD_CAL;
-                            end
+                            trim_val = best_code;    // apply the winner and stop
+                            wcnt     = 0;
+                            div_now  = 1;
+                            phase    = 7;
+                            state    = S_HOLD_CAL;
                             if (verbose)
                                 $strobe("LDO_TEST trim: best_code=%d err=%g target=%g",
                                         best_code, best_err, cal_tgt);
@@ -495,15 +475,6 @@ module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                             div_now = dn_ticks;  state = S_DN_DAC;
                             if (verbose) $strobe("LDO_TEST descent: %d tick(s)/code = %g us, I = %g A",
                                                  dn_ticks, dn_ticks*Tstep*1e6, il_now + id_now);
-                        end
-                    end
-
-                    S_TRIM_MV: begin
-                        if      (trim_val < trim_goal) trim_val = trim_val + 1;
-                        else if (trim_val > trim_goal) trim_val = trim_val - 1;
-                        if (trim_val == trim_goal) begin
-                            div_now = trim_div;
-                            state   = trim_ret;
                         end
                     end
 
