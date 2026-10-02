@@ -5,7 +5,7 @@
 //  common preamble.
 //
 //  PREAMBLE (modes 0..2, identical):
-//      slow ramp at Tstep per code  ->  code_pre (3.300 V)
+//      slow ramp at Tstep per code  ->  code_pre
 //      dwell  ->  trim search over trim[3:0]  ->  dwell with the found code
 //      discharge down to zero, one code per t_dn, with the sink on
 //      dwell at zero
@@ -14,20 +14,31 @@
 //      0  slow ramp again, same Tstep per code, up to code_init
 //      1  jump: no soft start at all.  Three ticks of t_jump so that act_en
 //         still changes on a tick of its own, then straight to code_init.
-//         This is the reference case -- the overshoot is supposed to be here.
-//      2  curve shaping sized from the target: fast steps at the slope the
-//         current limit can actually deliver, then the last n_tap codes with
+//         This is the reference case -- the overshoot belongs here.
+//      2  curve shaping sized from the target: fast steps at a slope the
+//         current limit can comfortably beat, then the last n_tap codes with
 //         the period stretched so the demanded current falls in equal steps.
 //      3  DC only.  The FSM never runs; the pins are driven from the _dc
-//         parameters.  Nothing here depends on an event having fired.
+//         parameters.  Nothing on that path depends on an event having fired.
 //
 //  CODE SPACE
 //      Everything walks one unified code u, where V_target = u * v_step.
 //          u <  U_ACT :  act_en = 0, ss = u,      dac = 0
 //          u >= U_ACT :  act_en = 1, ss = ss_top, dac = u - U_ACT
-//      U_ACT = v_base / v_step = 20, so u = 20 is 500 mV from either side and
+//      U_ACT = v_base / v_step, so u = U_ACT is 500 mV from either side and
 //      the hand-over tick changes act_en ALONE.  That is the junction rule:
 //      act_en must never move on the same tick as a code.
+//
+//  PACING -- the one thing mode 2 depends on
+//      The taper only shapes anything while the VOLTAGE loop, not the current
+//      limiter, owns the output.  If the commanded slope is faster than
+//      I_LIM/C_OUT can deliver, the command runs ahead, the part stays in
+//      current limit through the whole taper, and it leaves the limit at the
+//      target -- which is exactly what mode 1 does.  Mode 2 then produces the
+//      same picture as mode 1 and the taper has done nothing.
+//      So c_out / i_lim below are NOT typical values.  They are the worst-case
+//      SLOW pair: the largest capacitance and the smallest current limit the
+//      part will ever see.  pace_k derates the commanded slope further.
 //
 //  Hook-up:
 //      vout_sense -> LDO output.  Senses the node for the trim search and
@@ -42,19 +53,28 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     // ---------------- timing ----------------
     parameter real Tstep       = 200u;  // one code of the slow ramp (preamble and mode 0)
     parameter real start_delay = 100u;
-    parameter real tt          = 1u;    // logic edge
+    parameter real tt          = 1u;    // logic edge, UPPER bound only.  Mode 2 can step
+                                        // every few hundred ns, and an edge that long
+                                        // smears the commanded staircase into a smooth
+                                        // ramp -- not fatal for the output, but it makes
+                                        // the taper invisible on the dac bus.  The edge
+                                        // actually used is tt_e, clamped below.
     parameter real tt_i        = 1u;    // current edge
 
     // ---------------- code space ----------------
     parameter real    v_base    = 0.500;
     parameter real    v_step    = 0.025;
-    parameter integer code_pre  = 112 from [0:127];  // 3.300 V, where the trim is measured
+    parameter integer code_pre  = 112 from [0:127];  // where the trim is measured.  High is
+                                                     // better: one LSB moves the output in
+                                                     // proportion to the output itself, so
+                                                     // a low code_pre makes the search
+                                                     // blunt.  Needs headroom at that code.
     parameter integer code_init = 20  from [0:127];  // final target, 20 -> 1.000 V
-    parameter integer ss_init   = 1   from [0:31];   // code present at the DC operating point.
-                                                     // 0 means "target 0 V", which is a
-                                                     // degenerate point for an LDO: the pass
-                                                     // device sits in cutoff and the solver
-                                                     // has two valid answers.
+    parameter integer ss_init   = 1   from [0:31];   // code present at the DC operating
+                                                     // point.  0 means "target 0 V", a
+                                                     // degenerate point for an LDO: the
+                                                     // pass device sits in cutoff and the
+                                                     // solver has two valid answers.
 
     // ---------------- dwells ----------------
     parameter real t_hold_pre  = 300u;  // at code_pre before the trim search
@@ -65,32 +85,36 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     parameter real t_hold_end  = 500u;  // at the target, after the start
     parameter real t_jump      = 1u;    // mode 1 only, the act_en isolation tick
 
+    // ---------------- preamble bypass ----------------
+    parameter integer pre_en = 1 from [0:1];  // 0 = skip the preamble and go straight to
+                                              // the mode phase.  The preamble costs tens
+                                              // of ms at Tstep = 200 us and nothing in it
+                                              // shapes the start, so turn it off while
+                                              // comparing modes 0..2.
+
     // ---------------- trim search ----------------
-    parameter integer pre_en     = 1 from [0:1];   // 0 = skip the whole preamble and go
-                                                   // straight to the mode phase.  The
-                                                   // preamble costs ~33 ms at Tstep = 200 us
-                                                   // and nothing in it affects the start-up
-                                                   // shape, so turn it off while iterating
-                                                   // on modes 0..2.
-    parameter integer cal_en     = 1 from [0:1];   // 0 = hold trim_code, no search
-    parameter real    cal_target = 0;              // expected V_OUT at code_pre, 0 = auto
-    parameter integer trim_code  = 8 from [0:15];  // held while cal_en = 0, and before the search
+    parameter integer cal_en        = 1 from [0:1];   // 0 = hold trim_code, no search
+    parameter real    cal_target    = 0;              // expected V_OUT at code_pre, 0 = auto
+    parameter integer trim_code     = 8 from [0:15];  // held while cal_en = 0, and before
+                                                      // the search
+    parameter real    trim_min_span = 5m;             // the 16 codes must move the output by
+                                                      // at least this much, or the search
+                                                      // measured a constant and its answer
+                                                      // means nothing
 
     // ---------------- mode 2: curve shaping ----------------
-    //  The fast phase runs at the slope the limiter can actually deliver,
-    //  S0 = i_lim / c_out, so the command neither outruns the output nor
-    //  waits for it.  The taper then drops the demanded slope linearly to
-    //  alpha*S0, which makes the current fall in EQUAL steps -- that is what
-    //  keeps the hand-over out of the input line and out of the gate.
-    parameter real    c_out = 6u;
-    parameter real    i_lim = 500m;
-    parameter integer n_tap = 16 from [0:64];   // taper length, in codes
-    parameter real    alpha = 0.25 from (0:1];  // end of the taper, as a fraction of i_lim
+    parameter real    c_out  = 10u;   // LARGEST output capacitance to pace against
+    parameter real    i_lim  = 400m;  // SMALLEST current limit to pace against
+    parameter real    pace_k = 1.2 from (1:inf);  // extra derating of the commanded slope.
+                                                  // 1.2 = command 20 % slower than even the
+                                                  // worst-case pair above can deliver.
+    parameter integer n_tap  = 16 from [0:64];    // taper length, in codes
+    parameter real    alpha  = 0.25 from (0:1];   // end of the taper, as a fraction of i_lim
 
     // ---------------- currents ----------------
     parameter real i_load = 0;     // static load, applied once the target is reached
     parameter real i_dis  = 15m;   // discharge sink during the descent
-    parameter real i_end  = 1u;    // what the sink drops to at zero
+    parameter real i_end  = 1u;    // what the sink drops to once the node is at zero
 
     // ---------------- DC mode (mode 3) ----------------
     parameter integer code_dc = 20 from [0:127];
@@ -105,7 +129,8 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     // ---------------- levels ----------------
     parameter real    vdd_hv  = 2.5;
     parameter real    vddc    = 1.5;
-    parameter integer verbose = 1 from [0:1];
+    parameter integer verbose = 1 from [0:2];  // 0 = silent, 1 = key events,
+                                               // 2 = every phase and every trim code
 
     output [6:0] dac;        electrical [6:0] dac;
     output [4:0] ss;         electrical [4:0] ss;
@@ -115,8 +140,9 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     inout        vout_sense; electrical       vout_sense;
 
     integer u, u_tgt, u_pre, U_ACT, ss_top;
-    integer state, tsel, tap_i, trim_val;
-    real    t_next, dt_now, il_now, id_now, cal_tgt, s0, sf, t_fast, err;
+    integer state, st_prev, tsel, tap_i, trim_val;
+    real    t_next, dt_now, il_now, id_now, cal_tgt;
+    real    s_cmd, s_end, t_fast, tt_e, err, v_lo_t, v_hi_t;
 
     localparam S_PRE_UP    = 0;
     localparam S_PRE_HOLD  = 1;
@@ -136,9 +162,13 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     (* desc="unified code"                   *) integer u_s;
     (* desc="trim code found"                *) integer best_code;
     (* desc="trim error", units="V"          *) real    best_err;
+    (* desc="trim sweep span", units="V"     *) real    trim_span;
+    (* desc="trim search void"               *) integer trim_bad;
     (* desc="V_OUT during search", units="V" *) real    v_meas;
     (* desc="V_OUT after trim", units="V"    *) real    v_cal;
     (* desc="step period", units="s"         *) real    dt_s;
+    (* desc="commanded slope", units="V/s"   *) real    slope_s;
+    (* desc="demanded current", units="A"    *) real    i_dem;
     (* desc="load current", units="A"        *) real    i_l;
     (* desc="discharge current", units="A"   *) real    i_d;
 
@@ -151,7 +181,7 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
     (* desc="trim code driven" *) integer o_trim;
 
     //  Taper period for step i of n: the demanded slope falls linearly from
-    //  s0 to sf, so the demanded current falls in equal steps.
+    //  sa to sb, so the demanded current falls in equal steps.
     analog function real tap_per;
         input i, n, sa, sb, vstp;
         integer i, n;
@@ -173,21 +203,31 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
             u_tgt  = U_ACT + code_init;
 
             u = 0;  trim_val = trim_code;  best_code = trim_code;  best_err = 1k;
-            tsel = 0;  tap_i = 0;  phase = 0;
+            tsel = 0;  tap_i = 0;  phase = 0;  st_prev = -1;
             v_meas = 0.0;  v_cal = 0.0;  err = 0.0;
+            trim_span = 0.0;  trim_bad = 0;
+            v_lo_t = 1k;  v_hi_t = -1k;
             il_now = 0.0;  id_now = 0.0;
             state  = S_PRE_UP;
 
             if (cal_target > 0.0) cal_tgt = cal_target;
             else                  cal_tgt = v_base + v_step * code_pre;
 
-            //  mode 2 pacing, all of it derived -- nothing hand-tuned
-            s0     = i_lim / c_out;          // slope the limiter can deliver
-            t_fast = v_step / s0;            // one code at that slope
-            sf     = alpha * s0;             // slope at the end of the taper
+            //  Mode 2 pacing.  s_cmd is deliberately BELOW what the worst-case
+            //  slow pair can deliver, so the output tracks the command instead
+            //  of tracking the current limiter.  Everything else follows.
+            s_cmd  = (i_lim / c_out) / pace_k;
+            t_fast = v_step / s_cmd;
+            s_end  = alpha * (i_lim / c_out);
 
-            //  ss_init only matters for the DC operating point the transient
-            //  starts from; the FSM owns the code from the first tick on.
+            //  Logic edge: never longer than an eighth of the shortest step the
+            //  sequencer can take, or transition() re-targets before the previous
+            //  edge lands and the commanded staircase cannot be seen on the bus.
+            tt_e = tt;
+            if (mode == 2 && tt_e > t_fast / 8.0)  tt_e = t_fast / 8.0;
+            if (mode == 1 && tt_e > t_jump / 8.0)  tt_e = t_jump / 8.0;
+            if (tt_e < 1p) tt_e = 1p;
+
             if (mode == 3) begin
                 u      = 0;
                 t_next = 1.0;                // the FSM never runs in DC
@@ -203,11 +243,11 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                     id_now   = i_end;
                 end
             end
-            dt_s = dt_now;  u_s = u;
+            dt_s = dt_now;  u_s = u;  slope_s = 0.0;  i_dem = 0.0;
 
             if (verbose && mode != 3)
-                $strobe("LDO_START mode=%d  u_tgt=%d (%g V)  S0=%g V/s  t_fast=%g s  taper=%d codes",
-                        mode, u_tgt, u_tgt*v_step, s0, t_fast, n_tap);
+                $strobe("LDO_START mode=%d  u_tgt=%d (%g V)  s_cmd=%g V/s  t_fast=%g s  taper=%d codes  pace_k=%g",
+                        mode, u_tgt, u_tgt*v_step, s_cmd, t_fast, n_tap, pace_k);
         end
 
         //  One event per step.  t_next is accumulated, not recomputed from
@@ -232,6 +272,7 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                     phase = 2;
                     if (cal_en) begin
                         tsel = 0;  trim_val = 0;  best_err = 1k;
+                        v_lo_t = 1k;  v_hi_t = -1k;
                         state = S_TRIM;  dt_now = t_trim;
                     end else begin
                         trim_val = trim_code;
@@ -244,19 +285,33 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                 S_TRIM: begin
                     phase  = 3;
                     v_meas = V(vout_sense);
+                    if (v_meas < v_lo_t) v_lo_t = v_meas;
+                    if (v_meas > v_hi_t) v_hi_t = v_meas;
                     err    = abs(v_meas - cal_tgt);
                     if (err < best_err) begin
                         best_err  = err;
                         best_code = tsel;
                     end
+                    if (verbose > 1)
+                        $strobe("LDO_START   trim[%2d] -> V_out = %g V  (err %g V)",
+                                tsel, v_meas, err);
                     if (tsel < 15) begin
                         tsel = tsel + 1;  trim_val = tsel;  dt_now = t_trim;
                     end else begin
-                        trim_val = best_code;
+                        trim_val  = best_code;
+                        trim_span = v_hi_t - v_lo_t;
+                        //  If the output never moved across all 16 codes, the search
+                        //  had nothing to measure: no headroom at code_pre, the node
+                        //  clamped, or the trim bus is not reaching the string.  The
+                        //  code it returns is then meaningless, so say so.
+                        trim_bad = (trim_span < trim_min_span) ? 1 : 0;
                         state = S_TRIM_HOLD;  dt_now = t_hold_trim;
                         if (verbose)
-                            $strobe("LDO_START trim: code=%d err=%g V at %g V",
-                                    best_code, best_err, cal_tgt);
+                            $strobe("LDO_START trim: code=%d err=%g V at %g V, span=%g V",
+                                    best_code, best_err, cal_tgt, trim_span);
+                        if (trim_bad)
+                            $strobe("LDO_START WARNING: trim span %g V below %g V -- the output did not move. Measured %g..%g V against a target of %g V. Check headroom at code_pre.",
+                                    trim_span, trim_min_span, v_lo_t, v_hi_t, cal_tgt);
                     end
                 end
 
@@ -272,14 +327,18 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                     if (u > 0) begin
                         u = u - 1;  dt_now = t_dn;
                     end else begin
-                        id_now = i_end;
-                        state  = S_ZERO;  dt_now = t_zero;
+                        //  The sink stays ON into the zero dwell.  Dropping it here
+                        //  would freeze whatever charge the descent had not managed
+                        //  to remove, and the mode phase would start from a residual
+                        //  instead of from zero.
+                        state = S_ZERO;  dt_now = t_zero;
                     end
                 end
 
                 // ---------------- branch by mode ----------------
                 S_ZERO: begin
-                    phase = 6;
+                    phase  = 6;
+                    id_now = i_end;             // the node is at zero now
                     case (mode)
                     0: begin
                         state = S_M0_UP;   dt_now = Tstep;
@@ -292,8 +351,8 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                         if (u_tgt - n_tap > 0) begin
                             state = S_M2_FAST;  dt_now = t_fast;
                         end else begin
-                            u      = u + 1;
-                            dt_now = tap_per(0, n_tap, s0, sf, v_step);
+                            u      = u + 1;      // target too low for a fast phase
+                            dt_now = tap_per(0, n_tap, s_cmd, s_end, v_step);
                             tap_i  = 1;
                             state  = S_M2_TAP;
                         end
@@ -342,7 +401,7 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                         u = u + 1;  dt_now = t_fast;
                     end else begin
                         u      = u + 1;              // this tick IS taper step 0
-                        dt_now = tap_per(0, n_tap, s0, sf, v_step);
+                        dt_now = tap_per(0, n_tap, s_cmd, s_end, v_step);
                         tap_i  = 1;
                         state  = S_M2_TAP;
                     end
@@ -352,7 +411,7 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                     phase = 8;
                     if (u < u_tgt) begin
                         u = u + 1;
-                        dt_now = tap_per(tap_i, n_tap, s0, sf, v_step);
+                        dt_now = tap_per(tap_i, n_tap, s_cmd, s_end, v_step);
                         tap_i  = tap_i + 1;
                     end else begin
                         il_now = i_load;
@@ -368,8 +427,21 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
                 endcase
 
                 if (dt_now < 1p) dt_now = 1p;
+
+                //  Saved, so the commanded slope and the current it asks of the
+                //  pass element can be plotted next to V_OUT.
+                slope_s = v_step / dt_now;
+                i_dem   = c_out * slope_s;
+                dt_s    = dt_now;
+                u_s     = u;
+
+                if (verbose > 1 && state != st_prev) begin
+                    $strobe("LDO_START t=%g ms  phase=%d state=%d  u=%d  V_cmd=%g V  trim=%d  V_out=%g V",
+                            $abstime*1e3, phase, state, u, u*v_step, trim_val, V(vout_sense));
+                    st_prev = state;
+                end
+
                 t_next = t_next + dt_now;
-                dt_s = dt_now;  u_s = u;
             end
         end
 
@@ -379,7 +451,7 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
         //  zeros -- trim would not even carry trim_code.  So the static mode
         //  takes its values from the parameters and depends on no event.
         if (mode == 3) begin
-            o_dac  = code_dc;    o_ss  = ss_dc;
+            o_dac  = code_dc;    o_ss   = ss_dc;
             o_act  = act_dc;     o_trim = trim_code;
         end else begin
             o_trim = trim_val;
@@ -390,26 +462,26 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
             end
         end
 
-        V(dac[0]) <+ transition(((o_dac >> 0) & 1) * vdd_hv, 0, tt);
-        V(dac[1]) <+ transition(((o_dac >> 1) & 1) * vdd_hv, 0, tt);
-        V(dac[2]) <+ transition(((o_dac >> 2) & 1) * vdd_hv, 0, tt);
-        V(dac[3]) <+ transition(((o_dac >> 3) & 1) * vdd_hv, 0, tt);
-        V(dac[4]) <+ transition(((o_dac >> 4) & 1) * vdd_hv, 0, tt);
-        V(dac[5]) <+ transition(((o_dac >> 5) & 1) * vdd_hv, 0, tt);
-        V(dac[6]) <+ transition(((o_dac >> 6) & 1) * vdd_hv, 0, tt);
+        V(dac[0]) <+ transition(((o_dac >> 0) & 1) * vdd_hv, 0, tt_e);
+        V(dac[1]) <+ transition(((o_dac >> 1) & 1) * vdd_hv, 0, tt_e);
+        V(dac[2]) <+ transition(((o_dac >> 2) & 1) * vdd_hv, 0, tt_e);
+        V(dac[3]) <+ transition(((o_dac >> 3) & 1) * vdd_hv, 0, tt_e);
+        V(dac[4]) <+ transition(((o_dac >> 4) & 1) * vdd_hv, 0, tt_e);
+        V(dac[5]) <+ transition(((o_dac >> 5) & 1) * vdd_hv, 0, tt_e);
+        V(dac[6]) <+ transition(((o_dac >> 6) & 1) * vdd_hv, 0, tt_e);
 
-        V(ss[0]) <+ transition(((o_ss >> 0) & 1) * vddc, 0, tt);
-        V(ss[1]) <+ transition(((o_ss >> 1) & 1) * vddc, 0, tt);
-        V(ss[2]) <+ transition(((o_ss >> 2) & 1) * vddc, 0, tt);
-        V(ss[3]) <+ transition(((o_ss >> 3) & 1) * vddc, 0, tt);
-        V(ss[4]) <+ transition(((o_ss >> 4) & 1) * vddc, 0, tt);
+        V(ss[0]) <+ transition(((o_ss >> 0) & 1) * vddc, 0, tt_e);
+        V(ss[1]) <+ transition(((o_ss >> 1) & 1) * vddc, 0, tt_e);
+        V(ss[2]) <+ transition(((o_ss >> 2) & 1) * vddc, 0, tt_e);
+        V(ss[3]) <+ transition(((o_ss >> 3) & 1) * vddc, 0, tt_e);
+        V(ss[4]) <+ transition(((o_ss >> 4) & 1) * vddc, 0, tt_e);
 
-        V(act_en) <+ transition(o_act * vddc, 0, tt);
+        V(act_en) <+ transition(o_act * vddc, 0, tt_e);
 
-        V(trim[0]) <+ transition(((o_trim >> 0) & 1) * vddc, 0, tt);
-        V(trim[1]) <+ transition(((o_trim >> 1) & 1) * vddc, 0, tt);
-        V(trim[2]) <+ transition(((o_trim >> 2) & 1) * vddc, 0, tt);
-        V(trim[3]) <+ transition(((o_trim >> 3) & 1) * vddc, 0, tt);
+        V(trim[0]) <+ transition(((o_trim >> 0) & 1) * vddc, 0, tt_e);
+        V(trim[1]) <+ transition(((o_trim >> 1) & 1) * vddc, 0, tt_e);
+        V(trim[2]) <+ transition(((o_trim >> 2) & 1) * vddc, 0, tt_e);
+        V(trim[3]) <+ transition(((o_trim >> 3) & 1) * vddc, 0, tt_e);
 
         // ---- the sink: load + discharge, straight out of vout_sense ----
         i_l = transition(mode == 3 ? i_dc : il_now, 0, tt_i, tt_i);
@@ -422,12 +494,12 @@ module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
 
         //  expected output -> the error trace is simply V(vout) - V(v_ideal)
         V(v_ideal) <+ transition(o_act ? (v_base + v_step * o_dac)
-                                       : (v_step * o_ss), 0, tt);
+                                       : (v_step * o_ss), 0, tt_e);
 
         @(final_step)
             if (verbose && mode != 3)
-                $strobe("LDO_START end: phase=%d mode=%d u=%d trim=%d err=%g v_cal=%g",
-                        phase, mode, u, best_code, best_err, v_cal);
+                $strobe("LDO_START end: mode=%d phase=%d u=%d trim=%d span=%g V bad=%d v_cal=%g V",
+                        mode, phase, u, best_code, trim_span, trim_bad, v_cal);
     end
 
 endmodule
