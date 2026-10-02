@@ -1,538 +1,433 @@
 `include "constants.h"
 `include "discipline.h"
 
-//  System test / Monte-Carlo sequencer for the adaptive LDO.
+//  Start-up sequencer for the adaptive LDO.  Four start modes behind one
+//  common preamble.
 //
-//  soft start -> ramp to code_pre (3.300 V) -> heat to 150 C -> trim search
-//  -> cool back to the initial temperature -> down to 100 mV -> dwell ->
-//  MEASUREMENT RAMP to code_init (every code, error vs v_ideal) -> load steps
-//  -> discharge down to 100 mV -> the sink drops to i_end (1 uA) and it ends.
+//  PREAMBLE (modes 0..2, identical):
+//      slow ramp at Tstep per code  ->  code_pre (3.300 V)
+//      dwell  ->  trim search over trim[3:0]  ->  dwell with the found code
+//      discharge down to zero, one code per t_dn, with the sink on
+//      dwell at zero
 //
-//  The trim is searched at 3.3 V, where one LSB moves the output 6.6x more
-//  than at 500 mV -- the same place a tester would measure it.
+//  THEN, by mode:
+//      0  slow ramp again, same Tstep per code, up to code_init
+//      1  jump: no soft start at all.  Three ticks of t_jump so that act_en
+//         still changes on a tick of its own, then straight to code_init.
+//         This is the reference case -- the overshoot is supposed to be here.
+//      2  curve shaping sized from the target: fast steps at the slope the
+//         current limit can actually deliver, then the last n_tap codes with
+//         the period stretched so the demanded current falls in equal steps.
+//      3  DC only.  The FSM never runs; the pins are driven from the _dc
+//         parameters.  Nothing here depends on an event having fired.
 //
-//  Every descent step lasts exactly dn_ticks * Tstep.  A constant-current sink
-//  gives a constant dV/dt, so one number paces the whole ramp and the steps are
-//  identical -- no per-step adaptation anywhere.
-//
-//  v_ideal carries the expected output, so the MC error is simply
-//      V(vout) - V(v_ideal)      [ /0.025 for LSB, /V(v_ideal) for % ]
+//  CODE SPACE
+//      Everything walks one unified code u, where V_target = u * v_step.
+//          u <  U_ACT :  act_en = 0, ss = u,      dac = 0
+//          u >= U_ACT :  act_en = 1, ss = ss_top, dac = u - U_ACT
+//      U_ACT = v_base / v_step = 20, so u = 20 is 500 mV from either side and
+//      the hand-over tick changes act_en ALONE.  That is the junction rule:
+//      act_en must never move on the same tick as a code.
 //
 //  Hook-up:
-//      vout_sense -> LDO output.  Nothing else.  The module senses the node and
-//                    sinks load + discharge current from it directly.
-//                    Total current: I(<inst>:vout_sense).
-//                    Split: the saved reals i_l (load) and i_d (discharge).
-//      To run with no load at all, set i_lo = i_hi = i_dis_a = 0.
+//      vout_sense -> LDO output.  Senses the node for the trim search and
+//      sinks load + discharge current from it directly.
 
-module ldo_test_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
+module ldo_start_seq (dac, ss, act_en, trim, v_ideal, vout_sense);
+
+    // ---------------- mode ----------------
+    parameter integer mode = 0 from [0:3];
+    //  0 = slow ramp   1 = jump   2 = curve shaping   3 = DC
 
     // ---------------- timing ----------------
-    parameter real    Tstep       = 20u;
-    parameter real    start_delay = 100u;
-    parameter real    tt          = 1u;
-    parameter real    tt_dis      = 1u;
+    parameter real Tstep       = 200u;  // one code of the slow ramp (preamble and mode 0)
+    parameter real start_delay = 100u;
+    parameter real tt          = 1u;    // logic edge
+    parameter real tt_i        = 1u;    // current edge
 
-    // ---------------- codes ----------------
-    parameter integer code_init = 127 from [0:127];  // final target
-    parameter integer code_pre  = 112 from [0:127];  // plateau for heating + trim search.
-                                                     // 112 -> 3.300 V: the trim is measured
-                                                     // where its effect is largest, which is
-                                                     // how a tester would actually do it.
-    parameter integer dac_step  = 1 from [1:127];
-    parameter integer ss_top    = 19 from [1:31];
-    parameter integer ss_step   = 1 from [1:31];
-    parameter integer ss_low    = 4 from [0:31];     // 4 * 25 mV = 100 mV
+    // ---------------- code space ----------------
+    parameter real    v_base    = 0.500;
+    parameter real    v_step    = 0.025;
+    parameter integer code_pre  = 112 from [0:127];  // 3.300 V, where the trim is measured
+    parameter integer code_init = 20  from [0:127];  // final target, 20 -> 1.000 V
+    parameter integer ss_init   = 1   from [0:31];   // code present at the DC operating point.
+                                                     // 0 means "target 0 V", which is a
+                                                     // degenerate point for an LDO: the pass
+                                                     // device sits in cutoff and the solver
+                                                     // has two valid answers.
 
     // ---------------- dwells ----------------
-    parameter real hold_norm = 200u;   // at code_pre before heating
-    parameter real hold_hot  = 500u;   // at temp_trim before the search
-    parameter real hold_cal  = 500u;   // with the found code, still hot
-    parameter real hold_ret  = 500u;   // back at temp_start before descending
-    parameter real hold_low  = 500u;   // at 100 mV
-    parameter real hold_tgt  = 500u;   // at target before the load steps
-    parameter real t_lo      = 200u;
-    parameter real t_hi      = 200u;
-    parameter real hold_dis  = 100u;
-    parameter integer n_pulse = 2 from [1:inf);
-
-    // ---------------- temperature (same logic as trimm_cal) ----------------
-    parameter integer en_temp    = 1 from [0:1];
-    parameter real    temp_start = 27;    // initial = measurement temperature; may be 170
-    parameter real    temp_trim  = 150;   // trimm_cal temp_cal
-    parameter real    temp_step  = 1;     // degrees per micro-step.  $cds_set_temperature
-                                          // is a DISCONTINUOUS change of every device model
-                                          // at a single timepoint, so this is the size of
-                                          // the kick the solver has to swallow.  Halve it
-                                          // again if the ramp still will not converge.
-    parameter real    temp_dt    = 20u;   // time between micro-steps.  The ramp runs on its
-                                          // own time base, independent of Tstep, so a fine
-                                          // step costs resolution, not run time.
-    parameter real    temp_settle = 200u; // dwell after the goal is reached
+    parameter real t_hold_pre  = 300u;  // at code_pre before the trim search
+    parameter real t_trim      = 200u;  // per trim code
+    parameter real t_hold_trim = 300u;  // with the found code
+    parameter real t_dn        = 20u;   // one code of the descent
+    parameter real t_zero      = 300u;  // at zero before the mode phase
+    parameter real t_hold_end  = 500u;  // at the target, after the start
+    parameter real t_jump      = 1u;    // mode 1 only, the act_en isolation tick
 
     // ---------------- trim search ----------------
-    parameter integer cal_en     = 1 from [0:1];   // 1 = search at temp_trim, 0 = hold trim_code
-    parameter real    cal_target = 0;              // expected V_OUT at code_pre; 0 = auto
-    parameter integer cal_mult   = 10 from [1:inf);// Tstep ticks per trim code
-    parameter integer trim_code  = 8 from [0:15];  // held while cal_en = 0, and during
-                                                   // start-up / heating when cal_en = 1
+    parameter integer pre_en     = 1 from [0:1];   // 0 = skip the whole preamble and go
+                                                   // straight to the mode phase.  The
+                                                   // preamble costs ~33 ms at Tstep = 200 us
+                                                   // and nothing in it affects the start-up
+                                                   // shape, so turn it off while iterating
+                                                   // on modes 0..2.
+    parameter integer cal_en     = 1 from [0:1];   // 0 = hold trim_code, no search
+    parameter real    cal_target = 0;              // expected V_OUT at code_pre, 0 = auto
+    parameter integer trim_code  = 8 from [0:15];  // held while cal_en = 0, and before the search
 
-    // ---------------- measurement ramp ----------------
-    parameter integer up_mult = 1 from [1:inf);    // Tstep ticks per code on the final ascent
+    // ---------------- mode 2: curve shaping ----------------
+    //  The fast phase runs at the slope the limiter can actually deliver,
+    //  S0 = i_lim / c_out, so the command neither outruns the output nor
+    //  waits for it.  The taper then drops the demanded slope linearly to
+    //  alpha*S0, which makes the current fall in EQUAL steps -- that is what
+    //  keeps the hand-over out of the input line and out of the gate.
+    parameter real    c_out = 6u;
+    parameter real    i_lim = 500m;
+    parameter integer n_tap = 16 from [0:64];   // taper length, in codes
+    parameter real    alpha = 0.25 from (0:1];  // end of the taper, as a fraction of i_lim
 
-    // ---------------- load / discharge ----------------
-    parameter real    i_lo  = 20m;
-    parameter real    i_hi  = 380m;
-    parameter real    di_dt = 10M;     // A/s -> 10 A/us
-    parameter real    i_dis_a = 15m;   // discharge sink during the final descent
-    parameter real    i_end   = 1u;    // what the discharge drops to once 100 mV is reached
+    // ---------------- currents ----------------
+    parameter real i_load = 0;     // static load, applied once the target is reached
+    parameter real i_dis  = 15m;   // discharge sink during the descent
+    parameter real i_end  = 1u;    // what the sink drops to at zero
 
-    // ---------------- descent pacing (uniform) ----------------
-    // A constant-current sink makes dV/dt constant, so every code takes the same
-    // time.  dn_ticks is that time, in Tstep units, and it never varies.
-    parameter integer dn_auto = 1 from [0:1];   // 1 = size dn_ticks from c_out and the current
-    parameter integer dn_mult = 1 from [1:inf); // used when dn_auto = 0
-    parameter real    c_out   = 12u;
+    // ---------------- DC mode (mode 3) ----------------
+    parameter integer code_dc = 20 from [0:127];
+    parameter integer ss_dc   = 1  from [0:31];
+    parameter integer act_dc  = 1  from [0:1];
+    parameter real    i_dc    = 0;
 
-    parameter real v_base = 0.500;
-    parameter real v_step = 0.025;
+    // ---------------- solver aids ----------------
+    parameter real bnd_step  = 1u;    // max timestep inside the opening window
+    parameter real bnd_until = 200u;  // window length; 0 disables the bound
 
-    // ---------------- static / levels ----------------
-    parameter integer ss_def  = 0 from [0:31];
-    parameter integer act_def = 1 from [0:1];
-    parameter integer en_tran = 1 from [0:1];
+    // ---------------- levels ----------------
     parameter real    vdd_hv  = 2.5;
     parameter real    vddc    = 1.5;
     parameter integer verbose = 1 from [0:1];
 
-    output [6:0] dac;       electrical [6:0] dac;
-    output [4:0] ss;        electrical [4:0] ss;
-    output       act_en;    electrical       act_en;
-    output [3:0] trim;      electrical [3:0] trim;
-    output       v_ideal;   electrical       v_ideal;  // expected V_OUT, for the error trace
-    inout        vout_sense; electrical      vout_sense;  // senses V_OUT and sinks the current
+    output [6:0] dac;        electrical [6:0] dac;
+    output [4:0] ss;         electrical [4:0] ss;
+    output       act_en;     electrical       act_en;
+    output [3:0] trim;       electrical [3:0] trim;
+    output       v_ideal;    electrical       v_ideal;
+    inout        vout_sense; electrical       vout_sense;
 
-    integer dac_code, ss_code, act, trim_val;
-    integer state, cnt, wcnt, div_now, sub, pulse, cstep;
-    integer up_target, ss_target, up_final, dn_final, temp_final, up_div;
-    integer dn_ticks;
-    real    il_now, id_now, temp_goal, tt_load, cal_tgt;
+    integer u, u_tgt, u_pre, U_ACT, ss_top;
+    integer state, tsel, tap_i, trim_val;
+    real    t_next, dt_now, il_now, id_now, cal_tgt, s0, sf, t_fast, err;
 
-    localparam S_IDLE     = 0;
-    localparam S_UP_SS    = 1;
-    localparam S_UP_ACT   = 2;
-    localparam S_UP_LEGS  = 3;
-    localparam S_UP_DAC   = 4;
-    localparam S_HOLD_NRM = 5;
-    localparam S_TEMP_RMP = 6;   // shared, both directions
-    localparam S_HOLD_HOT = 7;
-    localparam S_CAL      = 8;   // sweep trim 0..15 at temp_trim
-    localparam S_HOLD_CAL = 9;
-    localparam S_HOLD_RET = 10;  // back at temp_start
-    localparam S_DN_DAC   = 11;
-    localparam S_DN_ACT   = 12;
-    localparam S_DN_SS0   = 13;
-    localparam S_DN_SS    = 14;
-    localparam S_HOLD_LOW = 15;
-    localparam S_HOLD_TGT = 16;
-    localparam S_LD_HI    = 17;
-    localparam S_LD_LO    = 18;
-    localparam S_DIS_ON   = 19;
-    localparam S_END      = 20;
+    localparam S_PRE_UP    = 0;
+    localparam S_PRE_HOLD  = 1;
+    localparam S_TRIM      = 2;
+    localparam S_TRIM_HOLD = 3;
+    localparam S_DN        = 4;
+    localparam S_ZERO      = 5;
+    localparam S_M0_UP     = 6;
+    localparam S_M1_PRE    = 7;
+    localparam S_M1_ACT    = 8;
+    localparam S_M1_JUMP   = 9;
+    localparam S_M2_FAST   = 10;
+    localparam S_M2_TAP    = 11;
+    localparam S_DONE      = 12;
 
-    (* desc="phase"                        *) integer phase;
-    (* desc="trim code found"              *) integer best_code;
-    (* desc="trim error", units="V"        *) real    best_err;
-    (* desc="V_OUT during search", units="V"*) real   v_meas;
-    (* desc="V_OUT after trim", units="V"  *) real    v_cal;
-    (* desc="measurement ramp start", units="s" *) real t_meas0;
-    (* desc="ticks per code on descent"    *) integer dn_ticks_s;
-    (* desc="temperature", units="C"       *) real    temp_cur;
-    (* desc="load current", units="A"      *) real    i_l;
-    (* desc="discharge current", units="A" *) real    i_d;
+    (* desc="phase"                          *) integer phase;
+    (* desc="unified code"                   *) integer u_s;
+    (* desc="trim code found"                *) integer best_code;
+    (* desc="trim error", units="V"          *) real    best_err;
+    (* desc="V_OUT during search", units="V" *) real    v_meas;
+    (* desc="V_OUT after trim", units="V"    *) real    v_cal;
+    (* desc="step period", units="s"         *) real    dt_s;
+    (* desc="load current", units="A"        *) real    i_l;
+    (* desc="discharge current", units="A"   *) real    i_d;
 
-    //  How many Tstep ticks one code needs, given a constant sink current.
-    //  Constant current -> constant dV/dt -> one number for the whole descent.
-    analog function integer dn_pace;
-        input vstep, cl, itot, ts, en_a, dmult;
-        real vstep, cl, itot, ts;
-        integer en_a, dmult;
-        real n;
+    //  What reaches the pins.  In the transient modes these follow the FSM;
+    //  in DC they come straight off the parameters, so nothing on this path
+    //  depends on an event having fired.
+    (* desc="dac code driven"  *) integer o_dac;
+    (* desc="ss code driven"   *) integer o_ss;
+    (* desc="act_en driven"    *) integer o_act;
+    (* desc="trim code driven" *) integer o_trim;
+
+    //  Taper period for step i of n: the demanded slope falls linearly from
+    //  s0 to sf, so the demanded current falls in equal steps.
+    analog function real tap_per;
+        input i, n, sa, sb, vstp;
+        integer i, n;
+        real sa, sb, vstp, s;
         begin
-            if (en_a == 0 || itot <= 0.0) n = dmult;
-            else begin
-                n = floor(vstep * cl / itot / ts) + 1.0;
-                if (n < 1.0) n = 1.0;
-            end
-            dn_pace = n;
+            if (n <= 1) s = sb;
+            else        s = sa - (sa - sb) * (i * 1.0) / (n - 1.0);
+            if (s < 1.0) s = 1.0;          // never divide by ~zero
+            tap_per = vstp / s;
         end
     endfunction
 
     analog begin
+
         @(initial_step) begin
-            dac_code = 0;  ss_code = 0;  act = 0;
-            trim_val = trim_code;  best_code = trim_code;  best_err = 1k;
-            v_meas = 0.0;  v_cal = 0.0;  t_meas0 = 0.0;
-            state = S_IDLE;  cnt = 0;  wcnt = 0;  sub = 0;  div_now = 1;
-            pulse = 0;  cstep = 0;  up_div = 1;
-            up_target = code_pre;  ss_target = ss_low;
-            up_final = 0;  dn_final = 0;  temp_final = 0;
+            U_ACT  = floor(v_base / v_step + 0.5);
+            ss_top = U_ACT - 1;
+            u_pre  = U_ACT + code_pre;
+            u_tgt  = U_ACT + code_init;
+
+            u = 0;  trim_val = trim_code;  best_code = trim_code;  best_err = 1k;
+            tsel = 0;  tap_i = 0;  phase = 0;
+            v_meas = 0.0;  v_cal = 0.0;  err = 0.0;
             il_now = 0.0;  id_now = 0.0;
-            phase = 0;
-            tt_load = (i_hi - i_lo) / di_dt;
-            if (tt_load < 1p) tt_load = 1p;
-            dn_ticks = dn_mult;  dn_ticks_s = dn_ticks;
+            state  = S_PRE_UP;
+
             if (cal_target > 0.0) cal_tgt = cal_target;
             else                  cal_tgt = v_base + v_step * code_pre;
-            temp_cur  = temp_start;
-            temp_goal = temp_start;    // the FSM arms the ramp; nothing moves before that
-            if (en_tran && en_temp) $cds_set_temperature(temp_cur);
-            if (!en_tran) begin
-                dac_code = code_init;
-                ss_code  = ss_def;
-                act      = act_def;
-                il_now   = i_lo;
-            end
-        end
 
-        //  Temperature walks on its own clock.  Small steps keep each
-        //  $cds_set_temperature discontinuity small enough for the solver,
-        //  and temp_dt keeps the ramp short in wall-clock time.
-        @(timer(start_delay, temp_dt)) begin
-            if (en_tran && en_temp) begin
-                if (abs(temp_cur - temp_goal) > temp_step) begin
-                    if (temp_goal > temp_cur) temp_cur = temp_cur + temp_step;
-                    else                      temp_cur = temp_cur - temp_step;
-                    $cds_set_temperature(temp_cur);
-                end else if (temp_cur != temp_goal) begin
-                    temp_cur = temp_goal;
-                    $cds_set_temperature(temp_cur);
+            //  mode 2 pacing, all of it derived -- nothing hand-tuned
+            s0     = i_lim / c_out;          // slope the limiter can deliver
+            t_fast = v_step / s0;            // one code at that slope
+            sf     = alpha * s0;             // slope at the end of the taper
+
+            //  ss_init only matters for the DC operating point the transient
+            //  starts from; the FSM owns the code from the first tick on.
+            if (mode == 3) begin
+                u      = 0;
+                t_next = 1.0;                // the FSM never runs in DC
+                dt_now = 1.0;
+            end else begin
+                u      = ss_init;
+                t_next = start_delay;
+                dt_now = Tstep;
+                if (!pre_en) begin
+                    u        = 0;
+                    trim_val = trim_code;
+                    state    = S_ZERO;
+                    id_now   = i_end;
                 end
             end
+            dt_s = dt_now;  u_s = u;
+
+            if (verbose && mode != 3)
+                $strobe("LDO_START mode=%d  u_tgt=%d (%g V)  S0=%g V/s  t_fast=%g s  taper=%d codes",
+                        mode, u_tgt, u_tgt*v_step, s0, t_fast, n_tap);
         end
 
-        @(timer(start_delay, Tstep)) begin
-            if (en_tran) begin
-                sub = sub + 1;
-                if (sub >= div_now) begin
-                    sub = 0;
-                    case (state)
+        //  One event per step.  t_next is accumulated, not recomputed from
+        //  $abstime, so the schedule never drifts.
+        @(timer(t_next)) begin
+            if (mode == 3) begin
+                t_next = t_next + 1.0;
+            end else begin
+                case (state)
 
-                    // ============ ascent (shared) ============
-                    S_IDLE: begin
-                        cnt = ss_step;
-                        if (cnt > ss_top) cnt = ss_top;
-                        ss_code = cnt;
-                        div_now = 1;  up_div = 1;  phase = 1;
-                        state = S_UP_SS;
+                // ---------------- preamble ----------------
+                S_PRE_UP: begin
+                    phase = 1;
+                    if (u < u_pre) begin
+                        u = u + 1;  dt_now = Tstep;
+                    end else begin
+                        state = S_PRE_HOLD;  dt_now = t_hold_pre;
                     end
+                end
 
-                    S_UP_SS: begin
-                        div_now = up_div;
-                        if (cnt < ss_top) begin
-                            cnt = cnt + ss_step;
-                            if (cnt > ss_top) cnt = ss_top;
-                            ss_code = cnt;
-                        end else state = S_UP_ACT;
+                S_PRE_HOLD: begin
+                    phase = 2;
+                    if (cal_en) begin
+                        tsel = 0;  trim_val = 0;  best_err = 1k;
+                        state = S_TRIM;  dt_now = t_trim;
+                    end else begin
+                        trim_val = trim_code;
+                        state = S_TRIM_HOLD;  dt_now = t_hold_trim;
                     end
+                end
 
-                    S_UP_ACT: begin
-                        act    = 1;          // MUX -> main
-                        il_now = i_lo;
-                        phase  = 2;
-                        state  = S_UP_LEGS;
+                //  Entered after t_trim has already elapsed with trim_val set,
+                //  so the sample at the top belongs to the code just held.
+                S_TRIM: begin
+                    phase  = 3;
+                    v_meas = V(vout_sense);
+                    err    = abs(v_meas - cal_tgt);
+                    if (err < best_err) begin
+                        best_err  = err;
+                        best_code = tsel;
                     end
-
-                    S_UP_LEGS: begin
-                        cnt = dac_step;      // clone unobserved -> legs off
-                        if (cnt > up_target) cnt = up_target;
-                        dac_code = cnt;
-                        ss_code  = 0;
-                        state    = S_UP_DAC;
+                    if (tsel < 15) begin
+                        tsel = tsel + 1;  trim_val = tsel;  dt_now = t_trim;
+                    end else begin
+                        trim_val = best_code;
+                        state = S_TRIM_HOLD;  dt_now = t_hold_trim;
+                        if (verbose)
+                            $strobe("LDO_START trim: code=%d err=%g V at %g V",
+                                    best_code, best_err, cal_tgt);
                     end
+                end
 
-                    S_UP_DAC: begin
-                        if (cnt < up_target) begin
-                            cnt = cnt + dac_step;
-                            if (cnt > up_target) cnt = up_target;
-                            dac_code = cnt;
+                S_TRIM_HOLD: begin
+                    phase  = 4;
+                    v_cal  = V(vout_sense);
+                    id_now = i_dis;                 // sink on, start down
+                    state  = S_DN;  dt_now = t_dn;
+                end
+
+                S_DN: begin
+                    phase = 5;
+                    if (u > 0) begin
+                        u = u - 1;  dt_now = t_dn;
+                    end else begin
+                        id_now = i_end;
+                        state  = S_ZERO;  dt_now = t_zero;
+                    end
+                end
+
+                // ---------------- branch by mode ----------------
+                S_ZERO: begin
+                    phase = 6;
+                    case (mode)
+                    0: begin
+                        state = S_M0_UP;   dt_now = Tstep;
+                    end
+                    1: begin
+                        state = S_M1_PRE;  dt_now = t_jump;
+                    end
+                    2: begin
+                        tap_i = 0;
+                        if (u_tgt - n_tap > 0) begin
+                            state = S_M2_FAST;  dt_now = t_fast;
                         end else begin
-                            wcnt    = 0;
-                            div_now = 1;
-                            if (up_final) begin
-                                phase = 10;
-                                state = S_HOLD_TGT;
-                                if (verbose)
-                                    $strobe("LDO_TEST measurement ramp done: %g s, dac=%d",
-                                            $abstime - t_meas0, dac_code);
-                            end else begin
-                                phase = 3;
-                                state = S_HOLD_NRM;
-                            end
+                            u      = u + 1;
+                            dt_now = tap_per(0, n_tap, s0, sf, v_step);
+                            tap_i  = 1;
+                            state  = S_M2_TAP;
                         end
                     end
-
-                    // ============ heat -> trim -> cool ============
-                    S_HOLD_NRM: begin
-                        wcnt = wcnt + 1;
-                        if (wcnt * Tstep >= hold_norm) begin
-                            if (en_temp) begin
-                                temp_goal  = temp_trim;
-                                temp_final = 0;
-                                wcnt       = 0;
-                                div_now    = 1;
-                                phase      = 4;
-                                state      = S_TEMP_RMP;
-                            end else begin
-                                wcnt = 0;  phase = 5;  state = S_HOLD_HOT;
-                            end
-                        end
+                    default: begin
+                        state = S_DONE;  dt_now = t_hold_end;
                     end
-
-                    S_TEMP_RMP: begin
-                        //  the ramp itself runs on the temp_dt timer; just wait for it
-                        if (temp_cur != temp_goal) wcnt = 0;
-                        else begin
-                            wcnt = wcnt + 1;
-                            if (wcnt * Tstep >= temp_settle) begin
-                                wcnt = 0;
-                                if (verbose)
-                                    $strobe("LDO_TEST at %g C, t=%g", temp_cur, $abstime);
-                                if (temp_final) begin
-                                    phase = 8;  state = S_HOLD_RET;
-                                end else begin
-                                    phase = 5;  state = S_HOLD_HOT;
-                                end
-                            end
-                        end
-                    end
-
-                    S_HOLD_HOT: begin
-                        wcnt = wcnt + 1;
-                        if (wcnt * Tstep >= hold_hot) begin
-                            if (cal_en) begin
-                                cstep    = 0;
-                                best_err = 1k;
-                                phase    = 6;
-                                div_now  = cal_mult;
-                                state    = S_CAL;
-                            end else begin
-                                wcnt = 0;  phase = 7;  state = S_HOLD_CAL;
-                            end
-                        end
-                    end
-
-                    S_CAL: begin
-                        // measure the code applied on the previous tick
-                        if (cstep > 0) begin
-                            v_meas = V(vout_sense);
-                            if (abs(v_meas - cal_tgt) < best_err) begin
-                                best_err  = abs(v_meas - cal_tgt);
-                                best_code = trim_val;
-                            end
-                        end
-                        if (cstep < 16) begin
-                            trim_val = cstep;
-                            cstep    = cstep + 1;
-                        end else begin
-                            trim_val = best_code;    // apply the winner and stop
-                            wcnt     = 0;
-                            div_now  = 1;
-                            phase    = 7;
-                            state    = S_HOLD_CAL;
-                            if (verbose)
-                                $strobe("LDO_TEST trim: best_code=%d err=%g target=%g",
-                                        best_code, best_err, cal_tgt);
-                        end
-                    end
-
-                    S_HOLD_CAL: begin
-                        v_cal = V(vout_sense);
-                        wcnt  = wcnt + 1;
-                        if (wcnt * Tstep >= hold_cal) begin
-                            if (en_temp) begin
-                                temp_goal  = temp_start;   // back to the measurement temperature
-                                temp_final = 1;
-                                wcnt       = 0;
-                                div_now    = 1;
-                                phase      = 4;
-                                state      = S_TEMP_RMP;
-                            end else begin
-                                wcnt = 0;  phase = 8;  state = S_HOLD_RET;
-                            end
-                        end
-                    end
-
-                    S_HOLD_RET: begin
-                        wcnt = wcnt + 1;
-                        if (wcnt * Tstep >= hold_ret) begin
-                            cnt       = up_target;     // descend from code_pre
-                            ss_target = ss_low;
-                            dn_final  = 0;
-                            dn_ticks  = dn_pace(v_step, c_out, il_now + id_now,
-                                                Tstep, dn_auto, dn_mult);
-                            dn_ticks_s = dn_ticks;
-                            div_now   = dn_ticks;
-                            phase     = 9;
-                            state     = S_DN_DAC;
-                            if (verbose) $strobe("LDO_TEST descent: %d tick(s)/code = %g us, I = %g A",
-                                                 dn_ticks, dn_ticks*Tstep*1e6, il_now + id_now);
-                        end
-                    end
-
-                    // ============ descent (shared) ============
-                    //  div_now is set to dn_ticks on entry and never touched again,
-                    //  so every code below takes exactly the same time.
-                    S_DN_DAC: begin
-                        if (cnt > dac_step) begin
-                            cnt = cnt - dac_step;  dac_code = cnt;
-                        end else begin
-                            dac_code = 0;  ss_code = ss_top;   // clone charged one step early
-                            state    = S_DN_ACT;
-                        end
-                    end
-
-                    S_DN_ACT: begin
-                        act   = 0;                 // MUX -> clone, one tick after the code
-                        state = S_DN_SS0;
-                    end
-
-                    S_DN_SS0: begin
-                        cnt = ss_top - ss_step;
-                        if (cnt < ss_target) cnt = ss_target;
-                        ss_code = cnt;
-                        state   = S_DN_SS;
-                    end
-
-                    S_DN_SS: begin
-                        if (cnt > ss_target) begin
-                            cnt = cnt - ss_step;
-                            if (cnt < ss_target) cnt = ss_target;
-                            ss_code = cnt;
-                        end else begin
-                            div_now = 1;  wcnt = 0;
-                            if (dn_final) begin
-                                id_now = i_end;    // sink parked, nothing left to drag
-                                phase  = 14;  state = S_END;
-                                if (verbose) $strobe("LDO_TEST end of descent: %g mV, idis -> %g A, t=%g",
-                                                     v_step*cnt*1e3, i_end, $abstime);
-                            end else begin
-                                phase = 9;   state = S_HOLD_LOW;
-                                if (verbose) $strobe("LDO_TEST at %g mV, t=%g",
-                                                     v_step*cnt*1e3, $abstime);
-                            end
-                        end
-                    end
-
-                    // ============ measurement ramp ============
-                    S_HOLD_LOW: begin
-                        wcnt = wcnt + 1;
-                        if (wcnt * Tstep >= hold_low) begin
-                            up_target = code_init;
-                            up_final  = 1;
-                            up_div    = up_mult;      // slower ticks for clean settling
-                            div_now   = up_mult;
-                            t_meas0   = $abstime;
-                            phase     = 1;
-                            state     = S_UP_SS;      // cnt already at ss_low
-                            if (verbose) $strobe("LDO_TEST measurement ramp start, t=%g", t_meas0);
-                        end
-                    end
-
-                    // ============ load steps ============
-                    S_HOLD_TGT: begin
-                        wcnt = wcnt + 1;
-                        if (wcnt * Tstep >= hold_tgt) begin
-                            pulse = 0;  wcnt = 0;  il_now = i_hi;
-                            phase = 11;  state = S_LD_HI;
-                        end
-                    end
-
-                    S_LD_HI: begin
-                        wcnt = wcnt + 1;
-                        if (wcnt * Tstep >= t_hi) begin
-                            il_now = i_lo;  wcnt = 0;
-                            phase = 12;  state = S_LD_LO;
-                        end
-                    end
-
-                    S_LD_LO: begin
-                        wcnt = wcnt + 1;
-                        if (wcnt * Tstep >= t_lo) begin
-                            pulse = pulse + 1;  wcnt = 0;
-                            if (pulse < n_pulse) begin
-                                il_now = i_hi;  phase = 11;  state = S_LD_HI;
-                            end else begin
-                                phase = 13;  state = S_DIS_ON;
-                            end
-                        end
-                    end
-
-                    // ============ discharge + final descent ============
-                    S_DIS_ON: begin
-                        id_now = i_dis_a;
-                        wcnt   = wcnt + 1;
-                        if (wcnt * Tstep >= hold_dis) begin
-                            cnt = code_init;  ss_target = ss_low;  dn_final = 1;
-                            dn_ticks = dn_pace(v_step, c_out, il_now + id_now,
-                                               Tstep, dn_auto, dn_mult);
-                            dn_ticks_s = dn_ticks;
-                            div_now = dn_ticks;  state = S_DN_DAC;
-                            if (verbose) $strobe("LDO_TEST descent: %d tick(s)/code = %g us, I = %g A",
-                                                 dn_ticks, dn_ticks*Tstep*1e6, il_now + id_now);
-                        end
-                    end
-
-                    S_END: begin
-                    end
-
                     endcase
                 end
+
+                // ---------------- mode 0: slow ramp ----------------
+                S_M0_UP: begin
+                    phase = 7;
+                    if (u < u_tgt) begin
+                        u = u + 1;  dt_now = Tstep;
+                    end else begin
+                        il_now = i_load;
+                        state  = S_DONE;  dt_now = t_hold_end;
+                    end
+                end
+
+                // ---------------- mode 1: jump ----------------
+                //  Three ticks, only so that act_en moves alone:
+                //    u -> U_ACT-1   soft-start code to the top, act_en still 0
+                //    u -> U_ACT     act_en goes high, dac still 0
+                //    u -> u_tgt     dac to the target, act_en steady
+                S_M1_PRE: begin
+                    phase = 7;
+                    u = U_ACT - 1;
+                    state = S_M1_ACT;  dt_now = t_jump;
+                end
+                S_M1_ACT: begin
+                    u = U_ACT;
+                    state = S_M1_JUMP;  dt_now = t_jump;
+                end
+                S_M1_JUMP: begin
+                    u = u_tgt;
+                    il_now = i_load;
+                    state  = S_DONE;  dt_now = t_hold_end;
+                end
+
+                // ---------------- mode 2: curve shaping ----------------
+                S_M2_FAST: begin
+                    phase = 7;
+                    if (u < u_tgt - n_tap) begin
+                        u = u + 1;  dt_now = t_fast;
+                    end else begin
+                        u      = u + 1;              // this tick IS taper step 0
+                        dt_now = tap_per(0, n_tap, s0, sf, v_step);
+                        tap_i  = 1;
+                        state  = S_M2_TAP;
+                    end
+                end
+
+                S_M2_TAP: begin
+                    phase = 8;
+                    if (u < u_tgt) begin
+                        u = u + 1;
+                        dt_now = tap_per(tap_i, n_tap, s0, sf, v_step);
+                        tap_i  = tap_i + 1;
+                    end else begin
+                        il_now = i_load;
+                        state  = S_DONE;  dt_now = t_hold_end;
+                    end
+                end
+
+                S_DONE: begin
+                    phase  = 9;
+                    dt_now = t_hold_end;
+                end
+
+                endcase
+
+                if (dt_now < 1p) dt_now = 1p;
+                t_next = t_next + dt_now;
+                dt_s = dt_now;  u_s = u;
             end
         end
 
         // ===================== outputs =====================
-        V(dac[0]) <+ transition(((dac_code >> 0) & 1) * vdd_hv, 0, tt);
-        V(dac[1]) <+ transition(((dac_code >> 1) & 1) * vdd_hv, 0, tt);
-        V(dac[2]) <+ transition(((dac_code >> 2) & 1) * vdd_hv, 0, tt);
-        V(dac[3]) <+ transition(((dac_code >> 3) & 1) * vdd_hv, 0, tt);
-        V(dac[4]) <+ transition(((dac_code >> 4) & 1) * vdd_hv, 0, tt);
-        V(dac[5]) <+ transition(((dac_code >> 5) & 1) * vdd_hv, 0, tt);
-        V(dac[6]) <+ transition(((dac_code >> 6) & 1) * vdd_hv, 0, tt);
+        //  Every integer here is 0 before @(initial_step) is seen.  Driving the
+        //  pins from the FSM variables would make a DC-only run read out as all
+        //  zeros -- trim would not even carry trim_code.  So the static mode
+        //  takes its values from the parameters and depends on no event.
+        if (mode == 3) begin
+            o_dac  = code_dc;    o_ss  = ss_dc;
+            o_act  = act_dc;     o_trim = trim_code;
+        end else begin
+            o_trim = trim_val;
+            if (u < U_ACT) begin
+                o_act = 0;  o_ss = u;       o_dac = 0;
+            end else begin
+                o_act = 1;  o_ss = ss_top;  o_dac = u - U_ACT;
+            end
+        end
 
-        V(ss[0]) <+ transition(((ss_code >> 0) & 1) * vddc, 0, tt);
-        V(ss[1]) <+ transition(((ss_code >> 1) & 1) * vddc, 0, tt);
-        V(ss[2]) <+ transition(((ss_code >> 2) & 1) * vddc, 0, tt);
-        V(ss[3]) <+ transition(((ss_code >> 3) & 1) * vddc, 0, tt);
-        V(ss[4]) <+ transition(((ss_code >> 4) & 1) * vddc, 0, tt);
+        V(dac[0]) <+ transition(((o_dac >> 0) & 1) * vdd_hv, 0, tt);
+        V(dac[1]) <+ transition(((o_dac >> 1) & 1) * vdd_hv, 0, tt);
+        V(dac[2]) <+ transition(((o_dac >> 2) & 1) * vdd_hv, 0, tt);
+        V(dac[3]) <+ transition(((o_dac >> 3) & 1) * vdd_hv, 0, tt);
+        V(dac[4]) <+ transition(((o_dac >> 4) & 1) * vdd_hv, 0, tt);
+        V(dac[5]) <+ transition(((o_dac >> 5) & 1) * vdd_hv, 0, tt);
+        V(dac[6]) <+ transition(((o_dac >> 6) & 1) * vdd_hv, 0, tt);
 
-        V(act_en) <+ transition(act * vddc, 0, tt);
+        V(ss[0]) <+ transition(((o_ss >> 0) & 1) * vddc, 0, tt);
+        V(ss[1]) <+ transition(((o_ss >> 1) & 1) * vddc, 0, tt);
+        V(ss[2]) <+ transition(((o_ss >> 2) & 1) * vddc, 0, tt);
+        V(ss[3]) <+ transition(((o_ss >> 3) & 1) * vddc, 0, tt);
+        V(ss[4]) <+ transition(((o_ss >> 4) & 1) * vddc, 0, tt);
 
-        V(trim[0]) <+ transition(((trim_val >> 0) & 1) * vddc, 0, tt);
-        V(trim[1]) <+ transition(((trim_val >> 1) & 1) * vddc, 0, tt);
-        V(trim[2]) <+ transition(((trim_val >> 2) & 1) * vddc, 0, tt);
-        V(trim[3]) <+ transition(((trim_val >> 3) & 1) * vddc, 0, tt);
+        V(act_en) <+ transition(o_act * vddc, 0, tt);
+
+        V(trim[0]) <+ transition(((o_trim >> 0) & 1) * vddc, 0, tt);
+        V(trim[1]) <+ transition(((o_trim >> 1) & 1) * vddc, 0, tt);
+        V(trim[2]) <+ transition(((o_trim >> 2) & 1) * vddc, 0, tt);
+        V(trim[3]) <+ transition(((o_trim >> 3) & 1) * vddc, 0, tt);
 
         // ---- the sink: load + discharge, straight out of vout_sense ----
-        // i_l / i_d are saved, so the two contributions stay separable in the
-        // waveform browser even though only their sum reaches the node.
-        i_l = transition(il_now, 0, tt_load, tt_load);   // 36 ns edge from di_dt
-        i_d = transition(id_now, 0, tt_dis,  tt_dis);
-
-        // compliance: smooth fold-back near zero so the sink cannot drive the
-        // node negative if the regulator gives up.  With the default
-        // v_comp = 10 mV the error is already below 1 nA at the 100 mV plateau.
-        // tanh is odd and C-infinity: below zero the branch becomes restoring
-        // instead of kinking, which is what keeps the solver happy.
+        i_l = transition(mode == 3 ? i_dc : il_now, 0, tt_i, tt_i);
+        i_d = transition(mode == 3 ? 0.0  : id_now, 0, tt_i, tt_i);
         I(vout_sense) <+ i_l + i_d;
 
-        // expected output -> error trace is simply V(vout) - V(v_ideal)
-        V(v_ideal) <+ transition(act ? (v_base + v_step * dac_code)
-                                     : (v_step * ss_code), 0, tt);
+        //  keep the solver on a short leash while the loop is closing
+        if (mode != 3 && bnd_until > 0.0 && $abstime < bnd_until)
+            $bound_step(bnd_step);
+
+        //  expected output -> the error trace is simply V(vout) - V(v_ideal)
+        V(v_ideal) <+ transition(o_act ? (v_base + v_step * o_dac)
+                                       : (v_step * o_ss), 0, tt);
 
         @(final_step)
-            $strobe("LDO_TEST end: phase=%d best_code=%d best_err=%g v_cal=%g temp=%g dn_ticks=%d",
-                    phase, best_code, best_err, v_cal, temp_cur, dn_ticks);
+            if (verbose && mode != 3)
+                $strobe("LDO_START end: phase=%d mode=%d u=%d trim=%d err=%g v_cal=%g",
+                        phase, mode, u, best_code, best_err, v_cal);
     end
 
 endmodule
